@@ -26,7 +26,18 @@ const ctx = await chromium.launchPersistentContext(PROFILE, {
 const page = ctx.pages()[0] || await ctx.newPage();
 page.on('pageerror', (e) => console.log('[页面错误]', String(e).slice(0, 150)));
 
-await page.goto('https://www.vanyaonline.com/', { waitUntil: 'domcontentloaded', timeout: 30000 });
+// 启动导航带重试（站点偶发抖动不应让服务崩掉）
+let navigated = false;
+for (let i = 1; i <= 3 && !navigated; i++) {
+  try {
+    await page.goto('https://www.vanyaonline.com/', { waitUntil: 'domcontentloaded', timeout: 45000 });
+    navigated = true;
+  } catch (e) {
+    console.log('[导航失败 ' + i + '/3]', e.message.slice(0, 80), '→ 8s 后重试');
+    await new Promise(r => setTimeout(r, 8000));
+  }
+}
+if (!navigated) { console.error('站点连续不可达，退出（稍后可重启本服务）'); process.exit(1); }
 
 // 2. 导航后自动重注入（模拟油猴行为：每次页面加载都注入一次）
 let injecting = false;

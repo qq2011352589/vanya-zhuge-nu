@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Vanya 挂机（宝箱 + 血线保护 · 强化版 v0.2 + UI）
 // @namespace    vanya.auto
-// @version      0.2.11
+// @version      0.2.13
 // @description  容错版：多语言文案兼容 + 多套选择器兜底 + 自诊断扫描 + 后台节流对抗 + 交互控制面板。右下角 ⚙ 打开面板。
 // @match        https://www.vanyaonline.com/*
 // @run-at       document-idle
@@ -9,6 +9,12 @@
 // ==/UserScript==
 
 /* ============================================================================
+ * v0.2.13：修正区域弹窗误判——弹窗是 position:fixed，visible() 的 offsetParent
+ *           判据恒 null 导致「弹窗已开却报未打开」。startHunt 两处 waitFor 补上
+ *           .explore-area-modal.is-open class 判定。
+ * v0.2.12：开狩猎修复——实测站点委托 handler 就绪前 tile 点击无效（曾卡选区页
+ *           数十分钟）。两道保险：①弹窗 8s 未响应则直接复刻 openAreaModal 激活；
+ *           ②explore 页 normal 态带 20s 冷却重试开狩猎。
  * v0.2.11：状态机盲区修复——healing 状态下页面流落 dashboard 时（实测站点会把
  *           页面拉回 dashboard），dashboard 分支此前不处理 healing，导致卡死到
  *           看门狗。现在主动跳回 /pub 继续回血闭环；healTimeout 兜底也恢复有效。
@@ -557,7 +563,18 @@
     log('选区域: ' + (chosen.slug || '(未知)') + ' Lv' + chosen.lv);
 
     try { chosen.el.click(); } catch (e) { fireMouse('mousedown', chosen.x, chosen.y, 1); fireMouse('mouseup', chosen.x, chosen.y, 0); }
-    const modal = await waitFor(() => allOf(SEL.areaModal).find(visible) || $('.modal.is-open'), 8000);
+    let modal = await waitFor(() => allOf(SEL.areaModal).find(visible) || $('.modal.is-open') || document.querySelector('.explore-area-modal.is-open'), 8000);
+    if (!modal) {
+      // v0.2.12: 站点委托 handler 就绪前点击不生效——直接复刻其 openAreaModal 激活弹窗
+      log('区域弹窗未响应，直接激活…');
+      const mm = document.getElementById('explore-area-modal-' + chosen.slug);
+      if (mm) {
+        mm.classList.add('is-open');
+        mm.setAttribute('aria-hidden', 'false');
+        document.body.classList.add('explore-modal-open');
+      }
+      modal = await waitFor(() => allOf(SEL.areaModal).find(visible) || $('.modal.is-open') || document.querySelector('.explore-area-modal.is-open'), 5000);
+    }
     if (!modal) { log('区域弹窗未打开'); S.set({ mode: 'normal' }); return; }
     const btn = await waitFor(() => byText(['button', 'a'], WORD.hunt, modal), 5000);
     if (!btn) { log('弹窗中找不到「狩猎」按钮（中英都试过）'); S.set({ mode: 'normal' }); return; }
@@ -703,7 +720,13 @@
         if (m === 'guard') { S.set({ mode: 'healing', healSince: Date.now() }); await pubHeal(); }
         else if (m === 'healing') await pubHeal();
       } else if (pg === 'explore') {
-        if (S.get('mode') === 'starting') await startHunt();
+        const m2 = S.get('mode');
+        if (m2 === 'starting') await startHunt();
+        else if (m2 === 'normal' && CFG.autoStartHunt && Date.now() - S.get('huntRetryAt', 0) > 20000) {
+          S.set({ huntRetryAt: Date.now(), mode: 'starting' });
+          log('选区页重试开狩猎…');
+          await startHunt();
+        }
       } else if (pg === 'index') {
         const m = S.get('mode', 'normal');
         if (m === 'normal') location.href = 'https://www.vanyaonline.com/actions/explore';
@@ -928,5 +951,5 @@
   tick();
   startTimer();
   startHeartbeat(tick);
-  log('v0.2.11 已启动（' + location.pathname + '）· 右下角 ⚙ 打开控制面板');
+  log('v0.2.13 已启动（' + location.pathname + '）· 右下角 ⚙ 打开控制面板');
 })();
