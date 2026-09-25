@@ -3,7 +3,7 @@ import { createServer } from 'http';
 import { readFileSync, mkdirSync } from 'fs';
 
 const PORT = Number(process.env.PORT || 8080);
-const VW = 1024, VH = 700;
+const VW = 450, VH = 900;   // 窄长竖屏：游戏宽屏信息密度低，窄屏更紧凑
 const PROFILE = new URL('./.profile/', import.meta.url).pathname;
 const SRC = readFileSync(new URL('./vanya_诸葛连弩.mjs', import.meta.url), 'utf8');
 const HTML = readFileSync(new URL('./screen.html', import.meta.url), 'utf8');
