@@ -18,10 +18,12 @@ const ctx = await chromium.launchPersistentContext(PROFILE, {
     // 反风控：去掉 HeadlessChrome 标识与 navigator.webdriver 标志
     '--disable-blink-features=AutomationControlled',
     '--force-prefers-reduced-motion',   // 告知站点减少动画，配合 CSS 动画暂停
+    '--js-flags=--max-old-space-size=192',  // 限渲染进程 JS 堆 192MB（1GB 内存机防 OOM）
     '--remote-debugging-port=9223',   // 仅供本地 Profiler 诊断，只绑 localhost
   ],
   userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36',
   viewport: { width: VW, height: VH },
+  timeout: 600000,   // 单核机器 chromium 初始化可能要几分钟，给足时间
 });
 const page = ctx.pages()[0] || await ctx.newPage();
 page.on('pageerror', (e) => console.log('[页面错误]', String(e).slice(0, 150)));
@@ -93,7 +95,7 @@ async function castStart(force) {
       frameTs = Date.now();
       try { await cdp.send('Page.screencastFrameAck', { sessionId: f.sessionId }); } catch (e) {}
     });
-    await cdp.send('Page.startScreencast', { format: 'jpeg', quality: 45, maxWidth: 640, everyNthFrame: 2 });
+    await cdp.send('Page.startScreencast', { format: 'jpeg', quality: 40, maxWidth: 460, everyNthFrame: 2 });
     castOn = true;
     console.log('[推流] 开启（有观看者）→', page.url().slice(0, 60));
   } catch (e) { console.log('[推流失败]', e.message.slice(0, 100)); }
@@ -111,7 +113,7 @@ setInterval(async () => {
   try {
     const crashed = await page.evaluate(() => 1)
       .then(() => false)
-      .catch(e => /crash|closed|detached|destroyed/i.test(e.message));
+      .catch(e => /Target crashed/i.test(e.message));   // 只认真崩溃；导航导致的 context destroyed 属正常
     if (crashed) {
       console.log('[自愈] 渲染进程崩溃，重新加载页面…', new Date().toLocaleTimeString());
       await page.goto('https://www.vanyaonline.com/', { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});

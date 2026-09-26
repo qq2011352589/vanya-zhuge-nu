@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Vanya 挂机（宝箱 + 血线保护 · 强化版 v0.2 + UI）
 // @namespace    vanya.auto
-// @version      0.2.13
+// @version      0.2.14
 // @description  容错版：多语言文案兼容 + 多套选择器兜底 + 自诊断扫描 + 后台节流对抗 + 交互控制面板。右下角 ⚙ 打开面板。
 // @match        https://www.vanyaonline.com/*
 // @run-at       document-idle
@@ -9,6 +9,7 @@
 // ==/UserScript==
 
 /* ============================================================================
+ * v0.2.14：界面语言自动切中文（无中文特征时点击语言按钮）。
  * v0.2.13：修正区域弹窗误判——弹窗是 position:fixed，visible() 的 offsetParent
  *           判据恒 null 导致「弹窗已开却报未打开」。startHunt 两处 waitFor 补上
  *           .explore-area-modal.is-open class 判定。
@@ -951,5 +952,17 @@
   tick();
   startTimer();
   startHeartbeat(tick);
-  log('v0.2.13 已启动（' + location.pathname + '）· 右下角 ⚙ 打开控制面板');
+
+  // v0.2.14: 站点界面语言自动切中文（页面无中文特征时点击语言按钮，每文档一次）
+  (async () => {
+    await sleep(2500);
+    try {
+      const txt = (document.body.innerText || '').slice(0, 1200);
+      if (/[\u4e00-\u9fa5]/.test(txt)) return;
+      const btn = byText(['button', 'a', 'li', 'span', 'div'], '中文(简体)|中文（简体）|简体中文');
+      if (btn) { btn.click(); log('检测到非中文界面，已切换为中文'); }
+      else dbg('未找到语言切换按钮');
+    } catch (e) {}
+  })();
+  log('v0.2.14 已启动（' + location.pathname + '）· 右下角 ⚙ 打开控制面板');
 })();
