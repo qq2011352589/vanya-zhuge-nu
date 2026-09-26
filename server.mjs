@@ -105,8 +105,20 @@ async function castStop(silent) {
   castOn = false; lastFrame = null;
   if (!silent) console.log('[推流] 停止（无人观看，省 CPU）');
 }
-// 守护：有观看者→保证推流在跑（含断流自愈）；没人看→缓冲 20s 后停掉
-setInterval(() => {
+// 守护：有观看者→保证推流在跑（含断流自愈）；没人看→缓冲 20s 后停掉；页面崩溃→自动重载
+setInterval(async () => {
+  // 崩溃自愈（OOM/渲染进程崩溃后 evaluate 会报 Target crashed）
+  try {
+    const crashed = await page.evaluate(() => 1)
+      .then(() => false)
+      .catch(e => /crash|closed|detached|destroyed/i.test(e.message));
+    if (crashed) {
+      console.log('[自愈] 渲染进程崩溃，重新加载页面…', new Date().toLocaleTimeString());
+      await page.goto('https://www.vanyaonline.com/', { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
+      lastFrame = null; frameTs = 0;
+      return;
+    }
+  } catch (e) {}
   const active = streamConns > 0 || Date.now() - lastShotAt < 5000;
   const stale = Date.now() - frameTs > 6000;
   if (active && (!castOn || stale)) castStart(true);
