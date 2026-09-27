@@ -3,7 +3,7 @@ import { createServer } from 'http';
 import { readFileSync, mkdirSync } from 'fs';
 
 const PORT = Number(process.env.PORT || 8080);
-const VW = 450, VH = 900;   // 窄长竖屏：游戏宽屏信息密度低，窄屏更紧凑
+const VW = 380, VH = 760;   // 窄长竖屏；1 核容器下更小的画布 = 更少的软件光栅化   // 窄长竖屏：游戏宽屏信息密度低，窄屏更紧凑
 const PROFILE = new URL('./.profile/', import.meta.url).pathname;
 const SRC = readFileSync(new URL('./vanya_诸葛连弩.mjs', import.meta.url), 'utf8');
 const HTML = readFileSync(new URL('./screen.html', import.meta.url), 'utf8');
@@ -19,6 +19,11 @@ const ctx = await chromium.launchPersistentContext(PROFILE, {
     '--disable-blink-features=AutomationControlled',
     '--force-prefers-reduced-motion',   // 告知站点减少动画，配合 CSS 动画暂停
     '--js-flags=--max-old-space-size=192',  // 限渲染进程 JS 堆 192MB（1GB 内存机防 OOM）
+    '--force-device-scale-factor=0.75',   // 渲染分辨率降到 75%：软件光栅化面积 -44%
+    '--disable-lcd-text',               // 软件渲染下文本次像素抗锯齿很贵
+    '--disable-composited-antialiasing',
+    '--disable-accelerated-2d-canvas',
+    '--num-raster-threads=1',           // 1 核上多光栅化线程只会互相抢
     '--disk-cache-size=33554432',        // 磁盘缓存上限 32MB——长期挂机不加限制会累积数百MB
     '--media-cache-size=8388608',        // 媒体缓存 8MB
     '--disable-application-cache',       // 站点未用 AppCache，关掉省一份缓存
@@ -70,12 +75,12 @@ await ensureInjected('首次');
 let mgmt = null;
 async function ensureThrottle() {
   if (mgmt) {
-    try { await mgmt.send('Emulation.setCPUThrottlingRate', { rate: 8 }); return; }
+    try { await mgmt.send('Emulation.setCPUThrottlingRate', { rate: 20 }); return; }
     catch (e) { mgmt = null; }
   }
   try {
     mgmt = await ctx.newCDPSession(page);
-    await mgmt.send('Emulation.setCPUThrottlingRate', { rate: 8 });
+    await mgmt.send('Emulation.setCPUThrottlingRate', { rate: 20 });
     console.log('[节流] 页面 CPU x8 已设置');
   } catch (e) {}
 }
@@ -86,6 +91,7 @@ await ensureThrottle();
 // 3. screencast：按需推流——有人看才抓帧（空闲时 JPEG 编码是 CPU 大头），断流自愈
 let lastFrame = null, frameTs = 0, cdp = null, castOn = false;
 let streamConns = 0, lastShotAt = 0, reissues = [];
+let castForced = null;   // null=按观看者自动；true=强制开；false=强制关（省 CPU）
 const IDLE_STOP_MS = 20000;
 
 async function castStart(force) {
@@ -98,7 +104,7 @@ async function castStart(force) {
       frameTs = Date.now();
       try { await cdp.send('Page.screencastFrameAck', { sessionId: f.sessionId }); } catch (e) {}
     });
-    await cdp.send('Page.startScreencast', { format: 'jpeg', quality: 40, maxWidth: 460, everyNthFrame: 2 });
+    await cdp.send('Page.startScreencast', { format: 'jpeg', quality: 30, maxWidth: 380, everyNthFrame: 4 });
     castOn = true;
     console.log('[推流] 开启（有观看者）→', page.url().slice(0, 60));
   } catch (e) { console.log('[推流失败]', e.message.slice(0, 100)); }
@@ -124,7 +130,7 @@ setInterval(async () => {
       return;
     }
   } catch (e) {}
-  const active = streamConns > 0 || Date.now() - lastShotAt < 5000;
+  const active = castForced !== null ? castForced : (streamConns > 0 || Date.now() - lastShotAt < 5000);
   if (active && !castOn) { castStart(true); return; }
   if (!active && castOn && Date.now() - frameTs > IDLE_STOP_MS) { castStop(); return; }
   // 有观看但长时间无新帧：优先同 session 重启推流（页面导航后 screencast 会自动停），
@@ -136,7 +142,7 @@ setInterval(async () => {
     reissues.push(now);
     frameTs = now;
     try {
-      await cdp.send('Page.startScreencast', { format: 'jpeg', quality: 40, maxWidth: 460, everyNthFrame: 2 });
+      await cdp.send('Page.startScreencast', { format: 'jpeg', quality: 30, maxWidth: 380, everyNthFrame: 4 });
       console.log('[推流] 同 session 重启');
     } catch (e) { castStart(true); }
   }
@@ -157,6 +163,16 @@ const server = createServer(async (req, res) => {
   if (u.pathname === '/') {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     return res.end(HTML);
+  }
+
+  // 画面开关：headless 下 screencast 会驱动渲染，关掉可显著降 CPU
+  if (u.pathname === '/api/cast') {
+    const v = u.searchParams.get('on');
+    castForced = v === '1' ? true : v === '0' ? false : null;
+    if (castForced === false) await castStop();
+    else if (castForced === true) await castStart(true);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({ ok: true, castForced, castOn }, null, 1));
   }
 
   if (u.pathname === '/stream.mjpg') {

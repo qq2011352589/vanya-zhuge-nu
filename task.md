@@ -91,40 +91,58 @@
 - 踩坑记录：`pkill -f "server.mjs"` 会匹配 ssh 命令行自杀，用 `pkill -x node`（但 node 的 comm 是
   {MainThread}，需用 cmdline 匹配——用 `pgrep -f "[s]erver[.]mjs"` 方括号技巧防自杀）
 
-## 长期运行稳定性（OOM 复盘 · 2026-09-27）
+## 长期运行稳定性复盘（2026-09-27 · 已两次修正）
 
-跑几小时正常、跑一天后开始 OOM 崩溃，实测数据（目标机 1 核 / 宿主内存紧）：
+### ⚠️ 数据源陷阱：容器里不要用 free 看容量
 
-| 指标 | 数值 | 性质 |
+PVE 的 CT 是 LXC 容器，**`/proc/meminfo`（即 `free -m`）未做内存命名空间隔离，显示的是宿主机全局数据**：
+
+| 来源 | 显示 | 真实含义 |
 |---|---|---|
-| chromium 匿名内存 | 218~285MB | 稳定，无泄漏 |
-| 页面 JS 堆 | 10MB | 很轻 |
-| cgroup file（页缓存） | 484MB | **大部分可回收** |
+| 容器内 `free -m` | Mem 11741MB / Swap 8192MB | **宿主机**（11.7G 内存 + 8G swap） |
+| PVE 面板 | 内存 768MB / swap 128MB | **容器真实配额** |
 
-**修正结论**：曾判断「chromium 磁盘缓存累积 491MB 是元凶」——**不准确**。
-实测 chromium 的 HTTP 缓存目录只有 41.5MB；那 484MB 的 `file` 主要是
-chromium 二进制与库文件的**页缓存**（file-backed，内核可随时丢弃，不是泄漏）。
+曾据此误判「内存枯竭、swap 8G 生效」——**两处全错**。
+判断容器容量请用 PVE 面板或 cgroup 文件（`/sys/fs/cgroup/memory.*`），不要信 `free`。
 
-真实机制：
+### 修正后的真实归因
+
+现象：跑一天后服务停摆、面板报 `VANYA is not defined`。
+
+真实机制（**与内存/OOM 无关**）：
 
 ```
-宿主整体内存紧张（available 一度只剩 128MB）＋ 目标机无 swap
-  → 内核只能靠回收页缓存腾空间，回收跟不上分配峰值
-  → OOM killer 杀 chromium
-  → 自愈重载 → 又分配 → 又被杀（循环，越杀越快）
-  → supervise-daemon 重启上限（respawn-max 5/30min）耗尽 → 服务彻底停摆
+容器 1 核，chromium 软件渲染（无 GPU，SwiftShader）吃满 CPU（PVE 实测 99.79%）
+  → 页面 evaluate 极慢/超时（ssh、API 同样受影响）
+  → 守护线程把「evaluate 失败」误判为渲染进程崩溃 → 反复重载
+  → 每次重载都重启 chromium，进一步吃满 CPU（恶性循环）
+  → supervise-daemon 重启上限（respawn-max 5/30min）耗尽 → 主动放弃监督 → 服务彻底停摆
 ```
 
-三层修复（均已部署）：
+内存实况（PVE 面板，全程宽松）：内存 37%（286/768MB）、swap 0.82%（1/128MB）——**从未接近 OOM**。
 
-1. **swap（核心）**：PVE 面板给目标机加 768MB swap，实测 `Swap: 8192`，
-   把「悬崖式 OOM」变成「缓慢换出」，压力期后 swap 用量回落到 ~1MB
-2. **缓存上限（加固）**：`--disk-cache-size=32MB --media-cache-size=8MB --disable-application-cache`
-   ——防未来缓存无限累积（虽然本次不是主因，但属于该配没配的参数）
-3. **每日重启（兜底）**：crond `0 5 * * * rc-service vanya restart`，斩断任何残余累积；
-   重启窗口几十秒，登录态在 profile、游戏进度在服务端，均无损失
+### 已部署的修复（对应真因）
 
-另修：`respawn-max` 改为无上限（原 5 次/30 分钟会让 supervise 永久放弃监督）。
+1. **自愈判定收紧**：只认 `Target crashed`，导航期 `context destroyed` 不再误判（治误判风暴）
+2. **respawn-max 去掉上限**：崩溃 5 秒自动拉起，不再因次数耗尽永久放弃（治停摆）
+3. **每日 05:00 `rc-service vanya restart`**（crond）：斩断任何残余累积
+4. **缓存上限加固**：`--disk-cache-size=32MB` 等（非主因，属该配没配）
+
+### CPU 优化实测：软件手段已到极限
+
+| 措施 | 容器 CPU |
+|---|---|
+| 视口 450×900 → 380×760 | 99.7% |
+| CPU 节流 x8 → x20 | 99.6% |
+| 关闭画面推流（screencast） | 99.6% ← 证明不是编码开销 |
+| 渲染分辨率 0.75x + 关抗锯齿 + 单光栅线程 | 99.6% |
+
+结论：CDP 的 `setCPUThrottlingRate` 只压 JS 执行速度，**不改变定时器驱动的重绘次数**，
+而 CPU 烧在软件合成/光栅化（Profiler 显示主线程 JS 99% idle）。
+1 核下这些优化压不动——**唯一有效解是给容器加 CPU 核，或禁用图片加载
+（`--blink-settings=imagesEnabled=false`，未测试）**。
+
+功能不受影响：狩猎、领宝箱、收益统计均正常；CPU 100% 只影响响应速度。
 
 ## 环境结论（源机 10.10.10.3）
 
