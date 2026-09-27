@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Vanya 挂机（宝箱 + 血线保护 · 强化版 v0.2 + UI）
 // @namespace    vanya.auto
-// @version      0.2.14
+// @version      0.2.15
 // @description  容错版：多语言文案兼容 + 多套选择器兜底 + 自诊断扫描 + 后台节流对抗 + 交互控制面板。右下角 ⚙ 打开面板。
 // @match        https://www.vanyaonline.com/*
 // @run-at       document-idle
@@ -9,6 +9,8 @@
 // ==/UserScript==
 
 /* ============================================================================
+ * v0.2.15：今日收益统计——宝箱领取结果解析累加（Gold/EXP/额外装备），
+ *           结算狩猎前抓 Hunt Insights 累加，VANYA.daily() 查询，按日期轮转。
  * v0.2.14：界面语言自动切中文（无中文特征时点击语言按钮）。
  * v0.2.13：修正区域弹窗误判——弹窗是 position:fixed，visible() 的 offsetParent
  *           判据恒 null 导致「弹窗已开却报未打开」。startHunt 两处 waitFor 补上
@@ -490,6 +492,53 @@
   }
 
   // ------------------------- 动作：血线保护 -------------------------
+  // ------------------------- v0.2.15 今日收益统计 -------------------------
+  function ensureDaily() {
+    const d = new Date().toISOString().slice(0, 10);
+    let st = S.get('daily', null);
+    if (!st || st.date !== d) {
+      st = { date: d, chest: [], hunt: { runs: 0, xp: 0, gold: 0 }, sum: { gold: 0, exp: 0, items: 0 } };
+      S.set({ daily: st });
+    }
+    return st;
+  }
+  function parseK(t) {
+    const m = String(t || '').match(/([\d.,]+)\s*([kKmM])?/);
+    if (!m) return 0;
+    let v = parseFloat(m[1].replace(/,/g, ''));
+    if (m[2]) v *= (m[2].toLowerCase() === 'k' ? 1e3 : 1e6);
+    return Math.round(v);
+  }
+  function dailyBox(res) {
+    try {
+      const st = ensureDaily();
+      st.chest.push(new Date().toTimeString().slice(0, 5) + ' ' + res);
+      const num = res.match(/\+([\d,]+)\s*(Gold|金币|EXP|经验)/i);
+      if (num) {
+        const v = parseInt(num[1].replace(/,/g, ''));
+        if (/gold|金币/i.test(num[2])) st.sum.gold += v; else st.sum.exp += v;
+      }
+      const item = res.match(/(?:额外奖励|Extra reward)s?[:：]?\s*(.{0,50}?)(?:\s*(?:继续狩猎|Continue)|$)/i);
+      if (item && item[1].trim()) { st.sum.items++; st.chest.push('　　└ 额外装备: ' + item[1].trim()); }
+      S.set({ daily: st });
+      dbg('收益统计已更新');
+    } catch (e) { dbg('统计失败:' + e.message); }
+  }
+  function dailyHunt() {
+    try {
+      const t = document.body.innerText || '';
+      const xp = t.match(/XP[:\s\n]+([\d.,]+\s*[kKmM]?)/);
+      const gold = t.match(/GOLD[:\s\n]+([\d.,]+\s*[kKmM]?)/i);
+      if (!xp && !gold) return;
+      const st = ensureDaily();
+      st.hunt.runs++;
+      if (xp) st.hunt.xp += parseK(xp[1]);
+      if (gold) st.hunt.gold += parseK(gold[1]);
+      S.set({ daily: st });
+      log('本轮狩猎结算: ' + (xp ? 'XP +' + xp[1] + ' ' : '') + (gold ? 'Gold +' + gold[1] : ''));
+    } catch (e) { dbg('狩猎统计失败:' + e.message); }
+  }
+
   async function maybeGuard() {
     const hp = huntHP();
     if (!hp) return false;
@@ -500,6 +549,7 @@
     if (Date.now() - last < 60000) { dbg('结算冷却中，跳过'); return false; }
     log('血线告警 ' + cur + '/' + max + '，触发止损…');
     S.set({ mode: 'guard', guardAt: Date.now(), maxLife: max });
+    dailyHunt();   // v0.2.15 结算前记录本轮收益
     const stop = first(SEL.stop) || byText(SEL.button, WORD.stop);
     if (stop) { stop.click(); return true; }
     log('找不到结算按钮（可能没在狩猎）');
@@ -690,7 +740,7 @@
             await sleep(delay);
             const r = await claimChest();
             log('领取结果: ' + r);
-            if (String(r).indexOf('claimed') === 0) S.set({ claimFail: 0, claimUnlockAt: Date.now() + 1000 });
+            if (String(r).indexOf('claimed') === 0) { S.set({ claimFail: 0, claimUnlockAt: Date.now() + 1000 }); dailyBox(String(r).slice(0, 160)); }
             else {
               const f = S.get('claimFail', 0) + 1;
               S.set({ claimFail: f });
@@ -751,6 +801,7 @@
     reset() { S.clear(); log('状态已清空'); },
     logTail(n = 40) { const b = JSON.parse(localStorage.getItem(LOG_KEY) || '[]'); console.log(b.slice(-n).join('\n')); return b.slice(-n); },
     page, claimChest, startHunt, pubHeal, solveHumanCheck, claimDaily, claimDemonPass,
+    daily: () => S.get('daily', null),
     readHP: huntHP, readPubLife: pubLife, readMaxLife: maxLife,
     setState(patch) { S.set(patch || {}); return S.all(); },
   };
@@ -964,5 +1015,5 @@
       else dbg('未找到语言切换按钮');
     } catch (e) {}
   })();
-  log('v0.2.14 已启动（' + location.pathname + '）· 右下角 ⚙ 打开控制面板');
+  log('v0.2.15 已启动（' + location.pathname + '）· 右下角 ⚙ 打开控制面板');
 })();

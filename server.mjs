@@ -82,7 +82,7 @@ await ensureThrottle();
 
 // 3. screencast：按需推流——有人看才抓帧（空闲时 JPEG 编码是 CPU 大头），断流自愈
 let lastFrame = null, frameTs = 0, cdp = null, castOn = false;
-let streamConns = 0, lastShotAt = 0;
+let streamConns = 0, lastShotAt = 0, reissues = [];
 const IDLE_STOP_MS = 20000;
 
 async function castStart(force) {
@@ -104,7 +104,7 @@ async function castStop(silent) {
   if (!castOn) return;
   try { await cdp.send('Page.stopScreencast'); } catch (e) {}
   try { await cdp.detach(); } catch (e) {}
-  castOn = false; lastFrame = null;
+  castOn = false;
   if (!silent) console.log('[推流] 停止（无人观看，省 CPU）');
 }
 // 守护：有观看者→保证推流在跑（含断流自愈）；没人看→缓冲 20s 后停掉；页面崩溃→自动重载
@@ -122,9 +122,21 @@ setInterval(async () => {
     }
   } catch (e) {}
   const active = streamConns > 0 || Date.now() - lastShotAt < 5000;
-  const stale = Date.now() - frameTs > 6000;
-  if (active && (!castOn || stale)) castStart(true);
-  else if (!active && castOn && Date.now() - frameTs > IDLE_STOP_MS) castStop();
+  if (active && !castOn) { castStart(true); return; }
+  if (!active && castOn && Date.now() - frameTs > IDLE_STOP_MS) { castStop(); return; }
+  // 有观看但长时间无新帧：优先同 session 重启推流（页面导航后 screencast 会自动停），
+  // 失败才重建 session。60s 内最多 3 次，避免页面静止时无限重建刷日志。
+  if (active && castOn && Date.now() - frameTs > 6000) {
+    const now = Date.now();
+    reissues = reissues.filter(t => now - t < 60000);
+    if (reissues.length >= 3) return;
+    reissues.push(now);
+    frameTs = now;
+    try {
+      await cdp.send('Page.startScreencast', { format: 'jpeg', quality: 40, maxWidth: 460, everyNthFrame: 2 });
+      console.log('[推流] 同 session 重启');
+    } catch (e) { castStart(true); }
+  }
 }, 4000);
 
 // 4. 执行走 page.evaluate（playwright 自动做 session 迁移，跨进程导航也安全）
