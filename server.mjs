@@ -13,12 +13,16 @@ mkdirSync(PROFILE, { recursive: true });
 const ctx = await chromium.launchPersistentContext(PROFILE, {
   executablePath: '/usr/bin/chromium-headless-shell',
   args: [
-    '--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu',
+    '--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu',   // headless-shell 实测用不上 iGPU（见下）
     '--process-per-site',   // 同站点共享渲染进程，减少进程数和内存
     // 反风控：去掉 HeadlessChrome 标识与 navigator.webdriver 标志
     '--disable-blink-features=AutomationControlled',
     '--force-prefers-reduced-motion',   // 告知站点减少动画，配合 CSS 动画暂停
     '--js-flags=--max-old-space-size=192',  // 限渲染进程 JS 堆 192MB（1GB 内存机防 OOM）
+    // 实测：iGPU 直通（/dev/dri/renderD128）对 headless-shell 无效——
+    // GPU 进程不会打开 /dev/dri（ozone-platform=headless 无显示表面，ANGLE 无法建
+    // 原生 GL 上下文，静默回退 SwiftShader）。曾加 --enable-gpu-rasterization /
+    // --use-gl=angle 等，CPU 仍为 99.6%，故撤回。真要硬件加速需 Xvfb + 完整 chromium。
     '--force-device-scale-factor=0.75',   // 渲染分辨率降到 75%：软件光栅化面积 -44%
     '--disable-lcd-text',               // 软件渲染下文本次像素抗锯齿很贵
     '--disable-composited-antialiasing',
