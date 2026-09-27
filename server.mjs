@@ -19,6 +19,9 @@ const ctx = await chromium.launchPersistentContext(PROFILE, {
     '--disable-blink-features=AutomationControlled',
     '--force-prefers-reduced-motion',   // 告知站点减少动画，配合 CSS 动画暂停
     '--js-flags=--max-old-space-size=192',  // 限渲染进程 JS 堆 192MB（1GB 内存机防 OOM）
+    '--disk-cache-size=33554432',        // 磁盘缓存上限 32MB——长期挂机不加限制会累积数百MB
+    '--media-cache-size=8388608',        // 媒体缓存 8MB
+    '--disable-application-cache',       // 站点未用 AppCache，关掉省一份缓存
     '--remote-debugging-port=9223',   // 仅供本地 Profiler 诊断，只绑 localhost
   ],
   userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36',
