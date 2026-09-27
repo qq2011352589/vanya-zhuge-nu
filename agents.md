@@ -2,7 +2,7 @@
 
 ## 目标
 
-把本目录下的 `vanya_诸葛连弩.mjs`（Tampermonkey 脚本 v0.2.7）在 vanyaonline.com 上稳定注入、逐项验证、长期值守。
+把本目录下的 `vanya_诸葛连弩.mjs`（Tampermonkey 脚本 v0.2.15，分发副本 `vanya-zhuge-nu.user.js` 带自动更新）在 vanyaonline.com 上稳定注入、逐项验证、长期值守。
 
 ## 脚本速览
 
@@ -13,6 +13,9 @@
 - 持久化：全部走 localStorage（`vanya_auto_cfg_v1` / `vanya_auto_state_v1` / `vanya_auto_cred_v1` / `vanya_auto_log`）
 - 调试接口 `window.VANYA`：
   `scan()` `tick()` `cfg({})` `setCred(u,p)` `state()` `setState({})` `reset()` `logTail(n)`
+  `daily()`（今日收益）`readHP()` `readPubLife()` `readMaxLife()`
+  `claimChest()` `startHunt()` `pubHeal()` `solveHumanCheck()` `claimDaily()` `claimDemonPass()`
+  `page()`（页面判定）
   `claimChest()` `startHunt()` `pubHeal()` `solveHumanCheck()` `claimDaily()` `claimDemonPass()`
   `readHP()` `readPubLife()` `readMaxLife()` `page()`
 - 关键配置：`choice`(wealth|growth|shadow) `guardPct`(35) `area` `jitterMax` `tickMs`

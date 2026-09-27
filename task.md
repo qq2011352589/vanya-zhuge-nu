@@ -54,6 +54,8 @@
 - [ ] 自动重登：`VANYA.setCred(u,p)` 后，会话失效能自动登录
 - [x] 人机验证：**实测通过** — 16:22:15 撞上 → 16:22:21 自动通过（6 秒）
 - [ ] 连续领取失败熔断：连败达 `claimFailBreak` 触发自愈
+- [~] 今日收益统计（v0.2.15）：宝箱/狩猎结算已接入 `VANYA.daily()`，待完整一天验证数据
+- [x] 界面自动切中文（v0.2.14）：实测 URL 带 lang=zh-CN 生效
 
 ## P3 · 参数调优（verify）
 
@@ -72,11 +74,28 @@
 
 ## 当前状态
 
-- 阶段：**P2 进行中** — 挂机已在真实环境闭环（登录→每日→人机验证→狩猎→领宝箱 RARE T3 +9442 EXP）
-- 手机面板：http://10.10.10.3:8080 运行中（server.mjs，持久化 profile）
-- 脚本版本：v0.2.9（A/B/C/D 四项全部修完并复验注入通过）
-- 静态审查：已完成，见 P1.5
-- 已知阻塞：未登录，游戏内页面（hunt/pub/dashboard）待验证 → 需要账号
+- 脚本版本：v0.2.15（含今日收益统计）
+- 运行环境：**10.10.10.4 独立挂机机**（Alpine 1 核/1GB），OpenRC `vanya` 服务守护中
+- 面板：http://10.10.10.4:8080（画面+遥控+今日收益按钮）
+- 本机 10.10.10.3：内存 512MB 仅运行 CodeBuddy，挂机服务已停（恢复需先扩内存再 `node server.mjs`）
+- 注意：两台机不要同时挂同一账号（会互踢会话）
+
+## 生产部署（10.10.10.4 · root / 密码见用户）
+
+- 目录：`/root/todo/vanya_诸葛连弩`（chromium profile 在 `vanya_%E8%AF%B8.../.profile`，URL 编码路径，含登录态勿删）
+- 依赖：`apk add nodejs npm chromium-headless-shell`（community 源 + 清华镜像）
+- 守护：`/etc/init.d/vanya`（supervisor="supervise-daemon"，--respawn-delay 5，**无次数上限**）
+  `rc-update add vanya default` 开机自启；`rc-service vanya start|stop|restart`
+- 传输：源机起临时文件服务（node http :9999）→ 目标机 `wget http://10.10.10.3:9999/`（scp/sftp 在 1 核机上不可靠）
+- 更新流程：本地改 → git push → 打包 tar → wget 传输 → `rc-service vanya restart`
+- 踩坑记录：`pkill -f "server.mjs"` 会匹配 ssh 命令行自杀，用 `pkill -x node`（但 node 的 comm 是
+  {MainThread}，需用 cmdline 匹配——用 `pgrep -f "[s]erver[.]mjs"` 方括号技巧防自杀）
+
+## 环境结论（源机 10.10.10.3）
+
+- 完整 chromium 渲染进程卡死（Seccomp+dbus），**chromium-headless-shell 可用**
+- 必需参数：`--no-sandbox --disable-dev-shm-usage`；1 核时 launch 需 `timeout: 600000`
+- 自愈判定只认 `Target crashed`（导航期 context destroyed 属正常，勿误判）
 
 ## 环境结论（2026-09-25 实测 · 旧结论已被推翻）
 
