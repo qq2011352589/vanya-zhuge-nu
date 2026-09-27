@@ -19,10 +19,12 @@ const ctx = await chromium.launchPersistentContext(PROFILE, {
     '--disable-blink-features=AutomationControlled',
     '--force-prefers-reduced-motion',   // 告知站点减少动画，配合 CSS 动画暂停
     '--js-flags=--max-old-space-size=192',  // 限渲染进程 JS 堆 192MB（1GB 内存机防 OOM）
+    '--enable-begin-frame-control',      // 帧手动驱动：合成器不再 60fps 空转（CPU 根治）
     // 实测：iGPU 直通（/dev/dri/renderD128）对 headless-shell 无效——
     // GPU 进程不会打开 /dev/dri（ozone-platform=headless 无显示表面，ANGLE 无法建
     // 原生 GL 上下文，静默回退 SwiftShader）。曾加 --enable-gpu-rasterization /
     // --use-gl=angle 等，CPU 仍为 99.6%，故撤回。真要硬件加速需 Xvfb + 完整 chromium。
+    '--blink-settings=imagesEnabled=false',  // 禁图省电模式：挂机只需文字/按钮，图片解码+光栅化是大头
     '--force-device-scale-factor=0.75',   // 渲染分辨率降到 75%：软件光栅化面积 -44%
     '--disable-lcd-text',               // 软件渲染下文本次像素抗锯齿很贵
     '--disable-composited-antialiasing',
@@ -94,30 +96,36 @@ await ensureThrottle();
 
 // 3. screencast：按需推流——有人看才抓帧（空闲时 JPEG 编码是 CPU 大头），断流自愈
 let lastFrame = null, frameTs = 0, cdp = null, castOn = false;
-let streamConns = 0, lastShotAt = 0, reissues = [];
+let streamConns = 0, lastShotAt = 0;
 let castForced = null;   // null=按观看者自动；true=强制开；false=强制关（省 CPU）
 const IDLE_STOP_MS = 20000;
 
+let castTimer = null;
 async function castStart(force) {
   if (castOn && !force) return;
-  await castStop(true);
-  try {
-    cdp = await ctx.newCDPSession(page);
-    cdp.on('Page.screencastFrame', async (f) => {
-      lastFrame = Buffer.from(f.data, 'base64');
-      frameTs = Date.now();
-      try { await cdp.send('Page.screencastFrameAck', { sessionId: f.sessionId }); } catch (e) {}
-    });
-    await cdp.send('Page.startScreencast', { format: 'jpeg', quality: 30, maxWidth: 380, everyNthFrame: 4 });
-    castOn = true;
-    console.log('[推流] 开启（有观看者）→', page.url().slice(0, 60));
-  } catch (e) { console.log('[推流失败]', e.message.slice(0, 100)); }
+  if (!cdp) { try { cdp = await ctx.newCDPSession(page); } catch (e) { console.log('[CDP失败]', e.message.slice(0, 80)); return; } }
+  castOn = true;
+  console.log('[推流] 开启（beginFrame 模式 ~2.5fps）→', page.url().slice(0, 60));
+  const loop = async () => {
+    if (!castOn || !cdp) return;
+    try {
+      const r = await cdp.send('HeadlessExperimental.beginFrame', { screenshot: { format: 'jpeg', quality: 30 } });
+      if (r && r.screenshotData) { lastFrame = Buffer.from(r.screenshotData, 'base64'); frameTs = Date.now(); }
+    } catch (e) {
+      // 导航后 session 失效 → 重建后下一轮继续
+      try { cdp = await ctx.newCDPSession(page); } catch (e2) {}
+    }
+  };
+  clearInterval(castTimer);
+  castTimer = setInterval(loop, 400);
+  loop();
 }
 async function castStop(silent) {
   if (!castOn) return;
-  try { await cdp.send('Page.stopScreencast'); } catch (e) {}
-  try { await cdp.detach(); } catch (e) {}
   castOn = false;
+  clearInterval(castTimer);
+  try { await cdp.detach(); } catch (e) {}
+  cdp = null;
   if (!silent) console.log('[推流] 停止（无人观看，省 CPU）');
 }
 // 守护：有观看者→保证推流在跑（含断流自愈）；没人看→缓冲 20s 后停掉；页面崩溃→自动重载
@@ -137,19 +145,6 @@ setInterval(async () => {
   const active = castForced !== null ? castForced : (streamConns > 0 || Date.now() - lastShotAt < 5000);
   if (active && !castOn) { castStart(true); return; }
   if (!active && castOn && Date.now() - frameTs > IDLE_STOP_MS) { castStop(); return; }
-  // 有观看但长时间无新帧：优先同 session 重启推流（页面导航后 screencast 会自动停），
-  // 失败才重建 session。60s 内最多 3 次，避免页面静止时无限重建刷日志。
-  if (active && castOn && Date.now() - frameTs > 6000) {
-    const now = Date.now();
-    reissues = reissues.filter(t => now - t < 60000);
-    if (reissues.length >= 3) return;
-    reissues.push(now);
-    frameTs = now;
-    try {
-      await cdp.send('Page.startScreencast', { format: 'jpeg', quality: 30, maxWidth: 380, everyNthFrame: 4 });
-      console.log('[推流] 同 session 重启');
-    } catch (e) { castStart(true); }
-  }
 }, 4000);
 
 // 4. 执行走 page.evaluate（playwright 自动做 session 迁移，跨进程导航也安全）
