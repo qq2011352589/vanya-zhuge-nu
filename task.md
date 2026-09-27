@@ -91,6 +91,41 @@
 - 踩坑记录：`pkill -f "server.mjs"` 会匹配 ssh 命令行自杀，用 `pkill -x node`（但 node 的 comm 是
   {MainThread}，需用 cmdline 匹配——用 `pgrep -f "[s]erver[.]mjs"` 方括号技巧防自杀）
 
+## 长期运行稳定性（OOM 复盘 · 2026-09-27）
+
+跑几小时正常、跑一天后开始 OOM 崩溃，实测数据（目标机 1 核 / 宿主内存紧）：
+
+| 指标 | 数值 | 性质 |
+|---|---|---|
+| chromium 匿名内存 | 218~285MB | 稳定，无泄漏 |
+| 页面 JS 堆 | 10MB | 很轻 |
+| cgroup file（页缓存） | 484MB | **大部分可回收** |
+
+**修正结论**：曾判断「chromium 磁盘缓存累积 491MB 是元凶」——**不准确**。
+实测 chromium 的 HTTP 缓存目录只有 41.5MB；那 484MB 的 `file` 主要是
+chromium 二进制与库文件的**页缓存**（file-backed，内核可随时丢弃，不是泄漏）。
+
+真实机制：
+
+```
+宿主整体内存紧张（available 一度只剩 128MB）＋ 目标机无 swap
+  → 内核只能靠回收页缓存腾空间，回收跟不上分配峰值
+  → OOM killer 杀 chromium
+  → 自愈重载 → 又分配 → 又被杀（循环，越杀越快）
+  → supervise-daemon 重启上限（respawn-max 5/30min）耗尽 → 服务彻底停摆
+```
+
+三层修复（均已部署）：
+
+1. **swap（核心）**：PVE 面板给目标机加 768MB swap，实测 `Swap: 8192`，
+   把「悬崖式 OOM」变成「缓慢换出」，压力期后 swap 用量回落到 ~1MB
+2. **缓存上限（加固）**：`--disk-cache-size=32MB --media-cache-size=8MB --disable-application-cache`
+   ——防未来缓存无限累积（虽然本次不是主因，但属于该配没配的参数）
+3. **每日重启（兜底）**：crond `0 5 * * * rc-service vanya restart`，斩断任何残余累积；
+   重启窗口几十秒，登录态在 profile、游戏进度在服务端，均无损失
+
+另修：`respawn-max` 改为无上限（原 5 次/30 分钟会让 supervise 永久放弃监督）。
+
 ## 环境结论（源机 10.10.10.3）
 
 - 完整 chromium 渲染进程卡死（Seccomp+dbus），**chromium-headless-shell 可用**
