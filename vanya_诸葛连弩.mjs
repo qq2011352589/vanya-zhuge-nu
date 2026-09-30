@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Vanya 挂机（宝箱 + 血线保护 · 强化版 v0.2 + UI）
 // @namespace    vanya.auto
-// @version      0.2.16
+// @version      0.2.17
 // @description  容错版：多语言文案兼容 + 多套选择器兜底 + 自诊断扫描 + 后台节流对抗 + 交互控制面板。右下角 ⚙ 打开面板。
 // @match        https://www.vanyaonline.com/*
 // @run-at       document-idle
@@ -9,6 +9,9 @@
 // ==/UserScript==
 
 /* ============================================================================
+ * v0.2.17：未识别页面(other)与卡住页面兜底——未知页观察 60s 后找 home/返回类
+ *           链接脱困，否则跳 dashboard；人机验证超 10 分钟撤到 dashboard。
+ *           （只穷举已知页面是脆的：站点新增 /dead.php 时就卡死了）
  * v0.2.16：阵亡页(/dead.php)识别与脱困（点 RETURN TO HOME → 回酒馆）；
  *           dashboard 待机时检测低血并自动去酒馆，防重伤流血致死（原止损只在 hunt 页生效）。
  * v0.2.15：今日收益统计——宝箱领取结果解析累加（Gold/EXP/额外装备），
@@ -77,6 +80,8 @@
   const DEFAULT_CFG = {
     choice: 'shadow',        // wealth | growth | shadow
     guardPct: 35,            // 血线保护阈值 %
+    humanTimeoutMs: 600000,  // 人机验证解不开的兜底：10 分钟后撤到 dashboard（别死等）
+    otherTimeoutMs: 60000,   // 未知页面（站点新增页）观察 60s 后主动脱困
     area: null,              // 指定区域 slug；null=自动挑等级最高的可用区域
     jitterMax: 60000,        // 宝箱就绪后随机延迟上限(ms)
     tickMs: 15000,           // 巡检间隔(ms)
@@ -728,9 +733,21 @@
       watchdog();
       const pg = page();
       dbg('tick page=' + pg);
+      // 回到已知页面时清掉脱困计时，下次再进未知页/验证页时重新起算
+      if (pg !== 'other' && S.get('otherSince', 0)) S.set({ otherSince: 0 });
+      if (pg !== 'human' && S.get('humanSince', 0)) S.set({ humanSince: 0 });
       if (pg === 'login' || /error=unauthorized|session.*expired/i.test(location.href)) {
         await autoLogin();
       } else if (pg === 'human') {
+        // 人机验证解不开时不能死等（曾因此卡 12 分钟，期间流血致死）：超时撤到 dashboard
+        const hs = S.get('humanSince', 0);
+        if (!hs) { S.set({ humanSince: Date.now() }); }
+        else if (Date.now() - hs > CFG.humanTimeoutMs) {
+          log('人机验证超过 ' + Math.round(CFG.humanTimeoutMs / 60000) + ' 分钟未通过，撤到 dashboard');
+          S.set({ humanSince: 0 });
+          location.href = 'https://www.vanyaonline.com/dashboard';
+          return;
+        }
         await solveHumanCheck();
       } else if (pg === 'hunt') {
         if (S.get('mode') === 'starting') S.set({ mode: 'normal' });
@@ -808,6 +825,17 @@
       } else if (pg === 'index') {
         const m = S.get('mode', 'normal');
         if (m === 'normal') location.href = 'https://www.vanyaonline.com/actions/explore';
+      } else if (pg === 'other') {
+        const os2 = S.get('otherSince', 0);
+        if (!os2) { S.set({ otherSince: Date.now() }); log('未知页面 ' + location.pathname + '，观察中…'); return; }
+        if (Date.now() - os2 < CFG.otherTimeoutMs) return;
+        log('未知页面 ' + location.pathname + ' 停留超过 ' + Math.round(CFG.otherTimeoutMs / 1000) + 's，主动脱困');
+        S.set({ otherSince: 0 });
+        const home2 = Array.from(document.querySelectorAll('a, button, [role=button]'))
+          .find((e) => /return|home|返回|首页|dashboard/i.test(e.innerText || '') && !/vanya|挂机/i.test(e.innerText || ''));
+        if (home2) { home2.click(); return; }
+        location.href = 'https://www.vanyaonline.com/dashboard';
+        return;
       }
     } catch (e) { log('异常: ' + (e && e.message ? e.message : e)); }
     finally { busy = false; }
@@ -1042,5 +1070,5 @@
       else dbg('未找到语言切换按钮');
     } catch (e) {}
   })();
-  log('v0.2.16 已启动（' + location.pathname + '）· 右下角 ⚙ 打开控制面板');
+  log('v0.2.17 已启动（' + location.pathname + '）· 右下角 ⚙ 打开控制面板');
 })();
