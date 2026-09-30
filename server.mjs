@@ -94,28 +94,34 @@ await ensureThrottle();
 
 // 3. screencast：按需推流——有人看才抓帧（空闲时 JPEG 编码是 CPU 大头），断流自愈
 let lastFrame = null, frameTs = 0, cdp = null, castOn = false;
-let streamConns = 0, lastShotAt = 0, reissues = [];
+let streamConns = 0, lastShotAt = 0;
 let castForced = null;   // null=按观看者自动；true=强制开；false=强制关（省 CPU）
 const IDLE_STOP_MS = 20000;
 
 async function castStart(force) {
   if (castOn && !force) return;
-  await castStop(true);
-  try {
-    cdp = await ctx.newCDPSession(page);
-    cdp.on('Page.screencastFrame', async (f) => {
-      lastFrame = Buffer.from(f.data, 'base64');
-      frameTs = Date.now();
-      try { await cdp.send('Page.screencastFrameAck', { sessionId: f.sessionId }); } catch (e) {}
-    });
-    await cdp.send('Page.startScreencast', { format: 'jpeg', quality: 30, maxWidth: 380, everyNthFrame: 4 });
-    castOn = true;
-    console.log('[推流] 开启（有观看者）→', page.url().slice(0, 60));
-  } catch (e) { console.log('[推流失败]', e.message.slice(0, 100)); }
+  if (!cdp) { try { cdp = await ctx.newCDPSession(page); } catch (e) { console.log('[CDP失败]', e.message.slice(0, 80)); return; } }
+  castOn = true;
+  console.log('[推流] 开启（主动截图模式 ~1.7fps，页面静止也不会冻帧）→', page.url().slice(0, 50));
+  const loop = async () => {
+    if (!castOn || !cdp) return;
+    try {
+      // 主动截图：不等页面产生新合成帧 —— headless 下页面静止时 screencast 不发帧，
+      // 会导致手机画面冻在旧帧上（看起来像死了）。主动出帧根治这个问题。
+      const r = await cdp.send('Page.captureScreenshot', { format: 'jpeg', quality: 30 });
+      if (r && r.data) { lastFrame = Buffer.from(r.data, 'base64'); frameTs = Date.now(); }
+    } catch (e) {
+      // 导航后 session 失效 → 重建，下一轮继续
+      try { cdp = await ctx.newCDPSession(page); } catch (e2) {}
+    }
+  };
+  clearInterval(castTimer);
+  castTimer = setInterval(loop, 600);
+  loop();
 }
 async function castStop(silent) {
   if (!castOn) return;
-  try { await cdp.send('Page.stopScreencast'); } catch (e) {}
+  clearInterval(castTimer);
   try { await cdp.detach(); } catch (e) {}
   castOn = false;
   if (!silent) console.log('[推流] 停止（无人观看，省 CPU）');
@@ -137,18 +143,11 @@ setInterval(async () => {
   const active = castForced !== null ? castForced : (streamConns > 0 || Date.now() - lastShotAt < 5000);
   if (active && !castOn) { castStart(true); return; }
   if (!active && castOn && Date.now() - frameTs > IDLE_STOP_MS) { castStop(); return; }
-  // 有观看但长时间无新帧：优先同 session 重启推流（页面导航后 screencast 会自动停），
-  // 失败才重建 session。60s 内最多 3 次，避免页面静止时无限重建刷日志。
-  if (active && castOn && Date.now() - frameTs > 6000) {
-    const now = Date.now();
-    reissues = reissues.filter(t => now - t < 60000);
-    if (reissues.length >= 3) return;
-    reissues.push(now);
-    frameTs = now;
-    try {
-      await cdp.send('Page.startScreencast', { format: 'jpeg', quality: 30, maxWidth: 380, everyNthFrame: 4 });
-      console.log('[推流] 同 session 重启');
-    } catch (e) { castStart(true); }
+  // 主动截图模式下不会"无新帧"（每次循环都出帧）；若长时间无帧说明 session 失效或页面卡死，
+  // 重建推流会话即可（castStart 内部会新建 CDP session）。
+  if (active && castOn && Date.now() - frameTs > 15000) {
+    console.log('[推流] 15s 无新帧，重建推流会话');
+    castStart(true);
   }
 }, 4000);
 

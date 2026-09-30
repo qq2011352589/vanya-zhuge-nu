@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Vanya 挂机（宝箱 + 血线保护 · 强化版 v0.2 + UI）
 // @namespace    vanya.auto
-// @version      0.2.15
+// @version      0.2.16
 // @description  容错版：多语言文案兼容 + 多套选择器兜底 + 自诊断扫描 + 后台节流对抗 + 交互控制面板。右下角 ⚙ 打开面板。
 // @match        https://www.vanyaonline.com/*
 // @run-at       document-idle
@@ -9,6 +9,8 @@
 // ==/UserScript==
 
 /* ============================================================================
+ * v0.2.16：阵亡页(/dead.php)识别与脱困（点 RETURN TO HOME → 回酒馆）；
+ *           dashboard 待机时检测低血并自动去酒馆，防重伤流血致死（原止损只在 hunt 页生效）。
  * v0.2.15：今日收益统计——宝箱领取结果解析累加（Gold/EXP/额外装备），
  *           结算狩猎前抓 Hunt Insights 累加，VANYA.daily() 查询，按日期轮转。
  * v0.2.14：界面语言自动切中文（无中文特征时点击语言按钮）。
@@ -183,6 +185,7 @@
     const p = location.pathname;
     if (p.includes('human_check') || $('.puzzle-hole')) return 'human';
     if (p.includes('login') || $('#login_username')) return 'login';
+    if (p.includes('dead')) return 'dead';   // 角色阵亡页（/dead.php）
     if (p.includes('/actions/hunt')) return 'hunt';
     if (p.includes('/actions/explore')) return 'explore';
     if (p.startsWith('/pub') || $('.pub-resource-label, .pub-heal')) return 'pub';
@@ -755,7 +758,31 @@
           const t = first(SEL.chestTimer);
           hud('狩猎中，等宝箱冷却' + (t ? '（' + norm(tx(t)) + '）' : ''));
         }
+      } else if (pg === 'dead') {
+        // 角色阵亡：本次狩猎累积收益清零。点 RETURN TO HOME 回首页，随后去酒馆回血。
+        log('角色阵亡，离开死亡页…');
+        S.set({ mode: 'healing', healSince: Date.now() });
+        const home = Array.from(document.querySelectorAll('a, button, [role=button]'))
+          .find((e) => /return|home|返回|首页/i.test(e.innerText || '') && !/vanya|挂机/i.test(e.innerText || ''));
+        if (home) { home.click(); return; }
+        location.href = 'https://www.vanyaonline.com/pub';
+        return;
       } else if (pg === 'dashboard') {
+        // 防流血致死：站点在重伤时会持续流血，原止损只在 hunt 页生效，
+        // 在 dashboard 待机（尤其人机验证期间）会一路流血到死。
+        const dl = (() => {
+          for (const e of allOf(SEL.maxLife)) {
+            const m = norm(tx(e)).match(/(\d[\d,]*)\s*\/\s*(\d[\d,]*)/);
+            if (m) return [parseInt(m[1].replace(/,/g, '')), parseInt(m[2].replace(/,/g, ''))];
+          }
+          return null;
+        })();
+        if (dl && dl[1] && dl[0] * 100 / dl[1] < Math.max(50, CFG.guardPct + 15)) {
+          log('待机时血量偏低 ' + dl[0] + '/' + dl[1] + '，去酒馆回血（防流血致死）');
+          S.set({ mode: 'healing', healSince: Date.now() });
+          location.href = 'https://www.vanyaonline.com/pub';
+          return;
+        }
         if (S.get('mode') === 'healing') { log('回血中流落 dashboard，回酒馆…'); S.set({ mode: 'healing' }); location.href = 'https://www.vanyaonline.com/pub'; return; }
         await claimDaily();
         await claimDemonPass();
@@ -1015,5 +1042,5 @@
       else dbg('未找到语言切换按钮');
     } catch (e) {}
   })();
-  log('v0.2.15 已启动（' + location.pathname + '）· 右下角 ⚙ 打开控制面板');
+  log('v0.2.16 已启动（' + location.pathname + '）· 右下角 ⚙ 打开控制面板');
 })();
