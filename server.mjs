@@ -116,7 +116,7 @@ async function castStart(force) {
     }
   };
   clearInterval(castTimer);
-  castTimer = setInterval(loop, 600);
+  castTimer = setInterval(loop, 1500);   // ~0.7fps：1 核机器上再快就压垮 CPU
   loop();
 }
 async function castStop(silent) {
