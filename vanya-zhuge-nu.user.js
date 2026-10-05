@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Vanya 挂机（宝箱 + 血线保护 · 强化版 v0.2 + UI）
 // @namespace    vanya.auto
-// @version      0.2.19
+// @version      0.2.20
 // @description  容错版：多语言文案兼容 + 多套选择器兜底 + 自诊断扫描 + 后台节流对抗 + 交互控制面板。右下角 ⚙ 打开面板。
 // @match        https://www.vanyaonline.com/*
 // @run-at       document-idle
@@ -9,6 +9,9 @@
 // ==/UserScript==
 
 /* ============================================================================
+ * v0.2.20：市场扫描（dry-run）——每天自动去 /actions/market 扫品类，
+ *           属性库评分（魔法1.0>剑0.8>弓0.65>防御0.5>生命0.2），
+ *           gold 计价且可提升的品类按提升量排名；只扫不买，报告在面板。
  * v0.2.19：装备展示人话化——槽位编号("3|Zulu Hat")使换装可看出部位；
  *           变更记 旧值→新值 而非仅差值；新增背包增减记录；
  *           VANYA.gearText()/gearLogText() 输出格式化文本（面板默认用它）。
@@ -88,6 +91,8 @@
   const DEFAULT_CFG = {
     choice: 'shadow',        // wealth | growth | shadow
     guardPct: 35,            // 血线保护阈值 %
+    marketAuto: true,           // 市场自动看一次（dry-run：只扫不买）
+    marketDryRun: true,       // true=只输出报告不动金币；确认规则后再改 false
     gearAuto: true,             // 每天自动采集一次装备/背包（后台取 HTML，不打扰挂机）
     gearIntervalMs: 72000000, // 采集间隔 20h
     humanTimeoutMs: 600000,  // 人机验证解不开的兜底：10 分钟后撤到 dashboard（别死等）
@@ -200,6 +205,7 @@
     const p = location.pathname;
     if (p.includes('human_check') || $('.puzzle-hole')) return 'human';
     if (p.includes('login') || $('#login_username')) return 'login';
+    if (p.includes('/actions/market')) return 'market';
     if (p.includes('dead')) return 'dead';   // 角色阵亡页（/dead.php）
     if (p.includes('/actions/hunt')) return 'hunt';
     if (p.includes('/actions/explore')) return 'explore';
@@ -707,6 +713,78 @@
     finally { S.set({ gearBusy: 0 }); }
   }
 
+  // ------------------------- v0.2.20 市场自动买装备（dry-run） -------------------------
+  // 市场是订单簿（/actions/market，JS 渲染）：品类按钮(.market-lvl-row) → 点开看卖单。
+  // 属性/数量在行内文本；价格需点开品类（真买版实现，dry-run 只评分排名）。
+  const GW = { '魔法': 1.0, magic: 1.0, '剑': 0.8, sword: 0.8, '剑术': 0.8, '弓': 0.65, bow: 0.65, '弓箭': 0.65, '防御': 0.5, defense: 0.5, '生命': 0.2, life: 0.2 };
+  function scoreOf(attrs) {
+    let s0 = 0;
+    for (const k in (attrs || {})) if (k !== 'req') s0 += (GW[k] !== undefined ? GW[k] : 0.3) * attrs[k];
+    return s0;
+  }
+  function attrLib() {
+    const lib = {}, g = S.get('gear', null);
+    if (!g) return lib;
+    for (const k in (g.equip || {})) lib[String(k).split('|').slice(1).join('|')] = (g.equip[k] || {}).attrs || {};
+    for (const it of (g.inv || [])) if (it.attrs && Object.keys(it.attrs).length) lib[it.n] = it.attrs;
+    return lib;
+  }
+  function decodeEnt2(t) {
+    return String(t || '').replace(/&#(\d+);/g, (m, d) => String.fromCharCode(+d));
+  }
+  // 从市场行文本提取属性（+15 Bow 等）——行内文本流形如 "+15 Bow | +15 Sword | x347"
+  function parseRowAttrs(txt) {
+    const attrs = {};
+    const parts = String(txt || '').split('|');
+    for (const p of parts) {
+      const m = p.trim().match(/^\+?(\d+)\s+([A-Za-z\u4e00-\u9fa5]+)/);
+      if (m) attrs[m[2]] = parseInt(m[1]);
+    }
+    return attrs;
+  }
+  async function marketScan() {
+    // 必须在 market 页；不在就导航（marketStep 状态机由 tick 驱动续步）
+    if (page() !== 'market') { location.href = '/actions/market'; return 'go'; }
+    S.set({ marketBusy: 1 });
+    try {
+      let rows = [].slice.call(document.querySelectorAll('[data-select-market-item]'));
+      if (!rows.length) {
+        for (const b of document.querySelectorAll('button')) if ((b.innerText || '').indexOf('Offers') >= 0) { b.click(); break; }
+        await sleep(5000);
+        rows = [].slice.call(document.querySelectorAll('[data-select-market-item]'));
+        if (!rows.length) return 'empty';
+      }
+      const lib = attrLib();
+      const cands = [];
+      for (const el of rows) {
+        const name = decodeEnt2(el.getAttribute('data-select-market-item') || '').replace(/ ◆.*$/, '').trim();
+        const cur = el.getAttribute('data-market-currencies') || '';
+        const txt = el.innerText || '';
+        const slotM = txt.match(/•\s*([A-Za-z]+)/);
+        const attrs = parseRowAttrs(txt);
+        const qtyM = txt.match(/x([\d,]+)\s*$/);
+        const base = lib[name] ? scoreOf(lib[name]) : null;
+        cands.push({ name, cur, slot: slotM ? slotM[1] : '', attrs, gain: (base === null ? null : +(scoreOf(attrs) - base).toFixed(1)), qty: qtyM ? qtyM[1] : '' });
+      }
+      const good = cands.filter((c) => /gold/i.test(c.cur) && c.gain !== null && c.gain > 0).sort((a, b) => b.gain - a.gain);
+      S.set({ marketCands: cands.slice(0, 20), marketTop: good.slice(0, 5), marketScanAt: Date.now() });
+      log('市场扫描: ' + cands.length + ' 品类, gold计价且可提升 ' + good.length + ' 件, 最优: ' + (good[0] ? good[0].name + ' (提升 ' + good[0].gain + ')' : '无'));
+      return good;
+    } finally { S.set({ marketBusy: 0 }); }
+  }
+  function marketText() {
+    const top = S.get('marketTop', []) || [], at = S.get('marketScanAt', 0);
+    const lines = [];
+    lines.push('== 市场侦查 ' + (at ? new Date(at).toLocaleString('zh-CN') : '未跑') + (S.get('marketDryRun', true) ? ' [dry-run]' : '') + ' ==');
+    if (!top.length) { lines.push('（无可购提升项或未扫描）'); return lines.join('\n'); }
+    for (const c of top) {
+      const a = [];
+      for (const p in (c.attrs || {})) a.push(p + '+' + c.attrs[p]);
+      lines.push('  ' + c.name + (c.slot ? ' [' + c.slot + ']' : '') + (a.length ? '  ' + a.join(' ') : '') + '  提升:' + c.gain);
+    }
+    return lines.join('\n');
+  }
+
   function ensureDaily() {
     const d = new Date().toISOString().slice(0, 10);
     let st = S.get('daily', null);
@@ -1010,6 +1088,10 @@
         await claimDaily();
         await claimDemonPass();
         await collectGear(false);   // v0.2.18 装备/背包采集（后台取 HTML，不切页签）
+        // v0.2.20 市场扫描（每天一次，dry-run 只评分不购买）：导航到市场后由 market 分支续步
+        if (CFG.marketAuto && S.get('mode', 'normal') === 'normal' && Date.now() - S.get('marketScanAt', 0) > 86400000 && S.get('otherSince', 0) === 0) {
+          log('去市场看看…'); location.href = '/actions/market'; return;
+        }
         if (CFG.autoStartHunt && S.get('mode', 'normal') === 'normal' && Date.now() - S.get('autoStartAt', 0) > 5 * 60 * 1000) {
           S.set({ mode: 'starting', autoStartAt: Date.now() });
           log('主页待机，自动去开启狩猎…');
@@ -1032,6 +1114,13 @@
       } else if (pg === 'index') {
         const m = S.get('mode', 'normal');
         if (m === 'normal') location.href = 'https://www.vanyaonline.com/actions/explore';
+      } else if (pg === 'market') {
+        // 市场分支：扫描评分后回 dashboard（dry-run 不购买）
+        if (S.get('marketBusy', 0)) return;
+        const r = await marketScan();
+        log('市场扫描结束(' + r + ')，回 dashboard');
+        location.href = 'https://www.vanyaonline.com/dashboard';
+        return;
       } else if (pg === 'other') {
         const os2 = S.get('otherSince', 0);
         if (!os2) { S.set({ otherSince: Date.now() }); log('未知页面 ' + location.pathname + '，观察中…'); return; }
@@ -1069,6 +1158,8 @@
     gearText: () => gearText(),
     gearLogText: (n = 20) => gearLogText(n),
     collectGear: (f) => collectGear(!!f),
+    marketScan: () => marketScan(),
+    marketText: () => marketText(),
     readHP: huntHP, readPubLife: pubLife, readMaxLife: maxLife,
     setState(patch) { S.set(patch || {}); return S.all(); },
   };
@@ -1282,5 +1373,5 @@
       else dbg('未找到语言切换按钮');
     } catch (e) {}
   })();
-  log('v0.2.19 已启动（' + location.pathname + '）· 右下角 ⚙ 打开控制面板');
+  log('v0.2.20 已启动（' + location.pathname + '）· 右下角 ⚙ 打开控制面板');
 })();
