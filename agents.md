@@ -13,7 +13,7 @@
 - 持久化：全部走 localStorage（`vanya_auto_cfg_v1` / `vanya_auto_state_v1` / `vanya_auto_cred_v1` / `vanya_auto_log`）
 - 调试接口 `window.VANYA`：
   `scan()` `tick()` `cfg({})` `setCred(u,p)` `state()` `setState({})` `reset()` `logTail(n)`
-  `daily()`（今日收益）`readHP()` `readPubLife()` `readMaxLife()`
+  `daily()`（今日收益）`gear()`（装备/背包快照）`gearLog(n)`（装备变更历史）`collectGear(f)`（立即采集）`readHP()` `readPubLife()` `readMaxLife()`
   `claimChest()` `startHunt()` `pubHeal()` `solveHumanCheck()` `claimDaily()` `claimDemonPass()`
   `page()`（页面判定）
   `claimChest()` `startHunt()` `pubHeal()` `solveHumanCheck()` `claimDaily()` `claimDemonPass()`

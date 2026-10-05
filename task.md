@@ -91,6 +91,38 @@
 - 踩坑记录：`pkill -f "server.mjs"` 会匹配 ssh 命令行自杀，用 `pkill -x node`（但 node 的 comm 是
   {MainThread}，需用 cmdline 匹配——用 `pgrep -f "[s]erver[.]mjs"` 方括号技巧防自杀）
 
+## 装备/背包采集（v0.2.18）
+
+站点 dashboard 的 HTML 是**服务端渲染**，装备/背包数据全在里面，因此采集走
+`fetch('/dashboard') + 正则`，**不切页签、不点「展开」、不打扰挂机主流程**。
+
+实测结构（2026-10-05）：
+
+```html
+<div class="equipment-stats-panel">              <!-- 套装加成面板 -->
+  <h4>套装加成 <button id="expand-set-bonuses">展开</button></h4>
+  <div class="item-bonuses-details">
+    <div class="equipped-item-detail">           <!-- 每件已装备 -->
+      <span class="item-name-level">Serpent 剑</span>
+      <div class="item-bonuses-list">
+        <span class="item-bonus">剑: <span class="bonus-value">+56</span></span>
+```
+
+- 已装备：`.equipped-item-detail`，属性在 `.item-bonus`（**键与值被嵌套 span 分开**）
+- 背包：`[data-item-title]` + `[data-item-details]`（属性文本，`<br>` 分隔），实测 **30 件**
+- 名称/属性是 HTML 数字实体（`&#21073;`=`剑`），需解码
+
+踩坑记录：
+1. **DOMParser 解析 941KB 太慢**：1 核机器上 30s+ 超时 → 改用正则（快一个量级）
+2. **属性键丢失**：正则只匹配无嵌套 span，漏掉外层 `item-bonus` → 改用嵌套匹配
+3. **槽位内容跨界**：取片段过长会混入下一件 → 以下一个 `equipped-item-detail` 为边界
+4. **中文属性格式**：`剑: +56` / `魔法: +50生命: +180`（多个粘连）→ 解析需支持「键: 数值」全局扫
+
+数据：`gear`(快照) / `gearLog`(变更历史, 限 60 条) / `gearAt` / `gearBusy`
+接口：`VANYA.gear()` `VANYA.gearLog(n)` `VANYA.collectGear(force)`
+面板：装备快照 / 装备变更 / 采集装备（screen.html）
+配置：`gearAuto` `gearIntervalMs`(20h)
+
 ## 长期运行稳定性复盘（2026-09-27 · 已两次修正）
 
 ### ⚠️ 数据源陷阱：容器里不要用 free 看容量

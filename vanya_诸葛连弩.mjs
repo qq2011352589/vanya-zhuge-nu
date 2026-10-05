@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Vanya 挂机（宝箱 + 血线保护 · 强化版 v0.2 + UI）
 // @namespace    vanya.auto
-// @version      0.2.17
+// @version      0.2.18
 // @description  容错版：多语言文案兼容 + 多套选择器兜底 + 自诊断扫描 + 后台节流对抗 + 交互控制面板。右下角 ⚙ 打开面板。
 // @match        https://www.vanyaonline.com/*
 // @run-at       document-idle
@@ -9,6 +9,11 @@
 // ==/UserScript==
 
 /* ============================================================================
+ * v0.2.18：装备/背包属性采集——后台取 dashboard HTML（服务端渲染已含数据），
+ *           解析 .equipped-item-detail（身上装备，含名称与属性列表）、
+ *           [data-item-title/details]（背包 30 件属性）、套装加成文本；
+ *           存最新快照+变更历史，VANYA.gear()/gearLog()/collectGear()；
+ *           不切页签不点按钮，对挂机零打扰。
  * v0.2.17：未识别页面(other)与卡住页面兜底——未知页观察 60s 后找 home/返回类
  *           链接脱困，否则跳 dashboard；人机验证超 10 分钟撤到 dashboard。
  *           （只穷举已知页面是脆的：站点新增 /dead.php 时就卡死了）
@@ -80,6 +85,8 @@
   const DEFAULT_CFG = {
     choice: 'shadow',        // wealth | growth | shadow
     guardPct: 35,            // 血线保护阈值 %
+    gearAuto: true,             // 每天自动采集一次装备/背包（后台取 HTML，不打扰挂机）
+    gearIntervalMs: 72000000, // 采集间隔 20h
     humanTimeoutMs: 600000,  // 人机验证解不开的兜底：10 分钟后撤到 dashboard（别死等）
     otherTimeoutMs: 60000,   // 未知页面（站点新增页）观察 60s 后主动脱困
     area: null,              // 指定区域 slug；null=自动挑等级最高的可用区域
@@ -501,6 +508,110 @@
 
   // ------------------------- 动作：血线保护 -------------------------
   // ------------------------- v0.2.15 今日收益统计 -------------------------
+  // ------------------------- v0.2.18 装备/背包采集 -------------------------
+  // 站点 dashboard 的 HTML 里就带全部数据（服务端渲染），所以后台 fetch + DOMParser
+  // 即可拿到：不用切页签、不用点「展开」、不打扰挂机主流程。
+  function parseAttrList(lines) {
+    const attrs = {}, raw = [];
+    for (const line of lines || []) {
+      let t = String(line || '').trim();
+      if (!t) continue;
+      const req = t.match(/Level Required[:：]\s*(\d+)/i);
+      if (req) { attrs.req = parseInt(req[1]); continue; }
+      // 中文「剑: +56」「魔法: +50生命: +180」——可能多个粘连，全局扫
+      const cn = t.match(/([^\s:：]{1,12})\s*[:：]\s*([+-]?\d+)/g);
+      if (cn) {
+        let hit = false;
+        for (const piece of cn) {
+          const m2 = piece.match(/([^\s:：]{1,12})\s*[:：]\s*([+-]?\d+)/);
+          if (m2) { attrs[m2[1].trim()] = parseInt(m2[2].replace('+', '')); hit = true; }
+        }
+        if (hit) continue;
+      }
+      // 英文「+9 Defense」/「Grants +9 Defense skill」
+      const m = t.match(/([+-]?\d+)\s+(.+?)(?:\s+skill)?$/i);
+      if (m) {
+        const k = String(m[2]).trim().toLowerCase().replace(/\s+/g, '_');
+        attrs[k] = parseInt(m[1].replace('+', ''));
+      } else raw.push(t);
+    }
+    return { attrs, raw };
+  }
+  function parseItemDetails(details) {
+    // data-item-details 形如 "Level Required: 1<br>Grants +9 Defense skill<br>+9 Defense"
+    const txt = String(details || '')
+      .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&').replace(/&quot;/g, '"');
+    const lines = txt.split(/<br\s*\/?>/i).map((x) => x.replace(/<[^>]+>/g, '').trim()).filter(Boolean);
+    return parseAttrList(lines);
+  }
+  function diffGear(prev, snap) {
+    const out = [], pe = (prev && prev.equip) || {}, ne = snap.equip || {};
+    for (const k in ne) {
+      const a = pe[k], b = ne[k];
+      if (!a) { out.push({ at: snap.at, date: snap.date, kind: 'equip', slot: k, to: k, delta: (b.attrs || {}) }); continue; }
+      const da = a.attrs || {}, db = b.attrs || {}, delta = {};
+      for (const p in db) if (db[p] !== da[p]) delta[p] = (db[p] || 0) - (da[p] || 0);
+      if (Object.keys(delta).length) out.push({ at: snap.at, date: snap.date, kind: 'stat', slot: k, delta });
+    }
+    for (const k in pe) if (!ne[k]) out.push({ at: snap.at, date: snap.date, kind: 'unequip', slot: k });
+    return out;
+  }
+  async function collectGear(force) {
+    if (!CFG.gearAuto && !force) return false;
+    if (S.get('gearBusy', 0)) return false;
+    const now = Date.now();
+    if (!force && now - S.get('gearAt', 0) < CFG.gearIntervalMs) return false;
+    S.set({ gearBusy: 1 });
+    try {
+      const ac = (typeof AbortController === 'function') ? new AbortController() : null;
+      const timer = ac ? setTimeout(() => ac.abort(), 45000) : null;   // 防挂起：45s 超时
+      const html = await fetch('/dashboard', { credentials: 'same-origin', signal: ac ? ac.signal : undefined }).then((r) => r.text());
+      if (timer) clearTimeout(timer);
+      // 不用 DOMParser：1 核机器上解析 941KB HTML 要 30s+，正则快一个量级
+      // 结构：<div class="equipped-item-detail"><span class="item-name-level">名</span>
+      //       <div class="item-bonuses-list"><span class="item-bonus">剑: <span class="bonus-value">+56</span></span>...
+      const decodeEnt = (t) => String(t || '').replace(/&#(\d+);/g, (m, d) => String.fromCharCode(+d))
+        .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&').replace(/&quot;/g, '"');
+      const equip = {};
+      let from = 0, autoIdx = 0;
+      for (;;) {
+        const p = html.indexOf('equipped-item-detail"', from);
+        if (p < 0) break;
+        const nx = html.indexOf('equipped-item-detail"', p + 22);      // 边界：下一个槽位
+        const seg = html.slice(p, nx > 0 ? nx : p + 600);
+        const nm = seg.match(/item-name-level[^>]*>([^<]*)</);
+        const bonuses = seg.match(/<span class="item-bonus">[\s\S]*?<\/span>\s*<\/span>/g) || [];
+        const lines = bonuses.map((x) => decodeEnt(x.replace(/<[^>]+>/g, ' ')).replace(/\s+/g, ' ').trim());
+        const name = decodeEnt(nm ? nm[1].trim() : ('slot' + (++autoIdx)));
+        if (!equip[name]) equip[name] = parseAttrList(lines);
+        from = p + 22;
+      }
+      const inv = [], titles = [], details = [];
+      let m;
+      const reT = /data-item-title="([^"]*)"/g;
+      while ((m = reT.exec(html))) titles.push(decodeEnt(m[1]));
+      const reD = /data-item-details="([^"]*)"/g;
+      while ((m = reD.exec(html))) details.push(m[1]);
+      for (let i = 0; i < titles.length; i++) inv.push({ n: titles[i], ...parseItemDetails(details[i] || '') });
+      const pi = html.indexOf('equipment-stats-panel');
+      const setBonus = pi < 0 ? [] : decodeEnt(html.slice(pi, pi + 2500).replace(/<[^>]+>/g, '\n'))
+        .split('\n').map((t) => t.trim()).filter(Boolean).slice(0, 14);
+      const snap = { at: Date.now(), date: new Date().toISOString().slice(0, 10), equip, inv, setBonus };
+      const prev = S.get('gear', null);
+      S.set({ gear: snap, gearAt: Date.now() });
+      if (prev) {
+        const ch = diffGear(prev, snap);
+        if (ch.length) {
+          S.set({ gearLog: (S.get('gearLog', []) || []).concat(ch).slice(-60) });
+          log('装备变更 ' + ch.length + ' 条');
+        }
+      }
+      log('装备采集完成：已装备 ' + Object.keys(equip).length + ' 件 / 背包 ' + inv.length + ' 件');
+      return true;
+    } catch (e) { log('装备采集失败: ' + (e && e.message ? e.message : e)); return false; }
+    finally { S.set({ gearBusy: 0 }); }
+  }
+
   function ensureDaily() {
     const d = new Date().toISOString().slice(0, 10);
     let st = S.get('daily', null);
@@ -803,6 +914,7 @@
         if (S.get('mode') === 'healing') { log('回血中流落 dashboard，回酒馆…'); S.set({ mode: 'healing' }); location.href = 'https://www.vanyaonline.com/pub'; return; }
         await claimDaily();
         await claimDemonPass();
+        await collectGear(false);   // v0.2.18 装备/背包采集（后台取 HTML，不切页签）
         if (CFG.autoStartHunt && S.get('mode', 'normal') === 'normal' && Date.now() - S.get('autoStartAt', 0) > 5 * 60 * 1000) {
           S.set({ mode: 'starting', autoStartAt: Date.now() });
           log('主页待机，自动去开启狩猎…');
@@ -857,6 +969,9 @@
     logTail(n = 40) { const b = JSON.parse(localStorage.getItem(LOG_KEY) || '[]'); console.log(b.slice(-n).join('\n')); return b.slice(-n); },
     page, claimChest, startHunt, pubHeal, solveHumanCheck, claimDaily, claimDemonPass,
     daily: () => S.get('daily', null),
+    gear: () => S.get('gear', null),
+    gearLog: (n = 20) => (S.get('gearLog', []) || []).slice(-n),
+    collectGear: (f) => collectGear(!!f),
     readHP: huntHP, readPubLife: pubLife, readMaxLife: maxLife,
     setState(patch) { S.set(patch || {}); return S.all(); },
   };
@@ -1070,5 +1185,5 @@
       else dbg('未找到语言切换按钮');
     } catch (e) {}
   })();
-  log('v0.2.17 已启动（' + location.pathname + '）· 右下角 ⚙ 打开控制面板');
+  log('v0.2.18 已启动（' + location.pathname + '）· 右下角 ⚙ 打开控制面板');
 })();

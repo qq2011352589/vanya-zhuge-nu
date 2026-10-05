@@ -1,16 +1,27 @@
 // ==UserScript==
 // @name         Vanya 挂机（宝箱 + 血线保护 · 强化版 v0.2 + UI）
 // @namespace    vanya.auto
-// @version      0.2.13
+// @version      0.2.18
 // @description  容错版：多语言文案兼容 + 多套选择器兜底 + 自诊断扫描 + 后台节流对抗 + 交互控制面板。右下角 ⚙ 打开面板。
 // @match        https://www.vanyaonline.com/*
 // @run-at       document-idle
 // @grant        none
-// @updateURL    https://raw.githubusercontent.com/qq2011352589/vanya-zhuge-nu/main/vanya-zhuge-nu.user.js
-// @downloadURL  https://raw.githubusercontent.com/qq2011352589/vanya-zhuge-nu/main/vanya-zhuge-nu.user.js
 // ==/UserScript==
 
 /* ============================================================================
+ * v0.2.18：装备/背包属性采集——后台取 dashboard HTML（服务端渲染已含数据），
+ *           解析 .equipped-item-detail（身上装备，含名称与属性列表）、
+ *           [data-item-title/details]（背包 30 件属性）、套装加成文本；
+ *           存最新快照+变更历史，VANYA.gear()/gearLog()/collectGear()；
+ *           不切页签不点按钮，对挂机零打扰。
+ * v0.2.17：未识别页面(other)与卡住页面兜底——未知页观察 60s 后找 home/返回类
+ *           链接脱困，否则跳 dashboard；人机验证超 10 分钟撤到 dashboard。
+ *           （只穷举已知页面是脆的：站点新增 /dead.php 时就卡死了）
+ * v0.2.16：阵亡页(/dead.php)识别与脱困（点 RETURN TO HOME → 回酒馆）；
+ *           dashboard 待机时检测低血并自动去酒馆，防重伤流血致死（原止损只在 hunt 页生效）。
+ * v0.2.15：今日收益统计——宝箱领取结果解析累加（Gold/EXP/额外装备），
+ *           结算狩猎前抓 Hunt Insights 累加，VANYA.daily() 查询，按日期轮转。
+ * v0.2.14：界面语言自动切中文（无中文特征时点击语言按钮）。
  * v0.2.13：修正区域弹窗误判——弹窗是 position:fixed，visible() 的 offsetParent
  *           判据恒 null 导致「弹窗已开却报未打开」。startHunt 两处 waitFor 补上
  *           .explore-area-modal.is-open class 判定。
@@ -74,6 +85,10 @@
   const DEFAULT_CFG = {
     choice: 'shadow',        // wealth | growth | shadow
     guardPct: 35,            // 血线保护阈值 %
+    gearAuto: true,             // 每天自动采集一次装备/背包（后台取 HTML，不打扰挂机）
+    gearIntervalMs: 72000000, // 采集间隔 20h
+    humanTimeoutMs: 600000,  // 人机验证解不开的兜底：10 分钟后撤到 dashboard（别死等）
+    otherTimeoutMs: 60000,   // 未知页面（站点新增页）观察 60s 后主动脱困
     area: null,              // 指定区域 slug；null=自动挑等级最高的可用区域
     jitterMax: 60000,        // 宝箱就绪后随机延迟上限(ms)
     tickMs: 15000,           // 巡检间隔(ms)
@@ -182,6 +197,7 @@
     const p = location.pathname;
     if (p.includes('human_check') || $('.puzzle-hole')) return 'human';
     if (p.includes('login') || $('#login_username')) return 'login';
+    if (p.includes('dead')) return 'dead';   // 角色阵亡页（/dead.php）
     if (p.includes('/actions/hunt')) return 'hunt';
     if (p.includes('/actions/explore')) return 'explore';
     if (p.startsWith('/pub') || $('.pub-resource-label, .pub-heal')) return 'pub';
@@ -491,6 +507,157 @@
   }
 
   // ------------------------- 动作：血线保护 -------------------------
+  // ------------------------- v0.2.15 今日收益统计 -------------------------
+  // ------------------------- v0.2.18 装备/背包采集 -------------------------
+  // 站点 dashboard 的 HTML 里就带全部数据（服务端渲染），所以后台 fetch + DOMParser
+  // 即可拿到：不用切页签、不用点「展开」、不打扰挂机主流程。
+  function parseAttrList(lines) {
+    const attrs = {}, raw = [];
+    for (const line of lines || []) {
+      let t = String(line || '').trim();
+      if (!t) continue;
+      const req = t.match(/Level Required[:：]\s*(\d+)/i);
+      if (req) { attrs.req = parseInt(req[1]); continue; }
+      // 中文「剑: +56」「魔法: +50生命: +180」——可能多个粘连，全局扫
+      const cn = t.match(/([^\s:：]{1,12})\s*[:：]\s*([+-]?\d+)/g);
+      if (cn) {
+        let hit = false;
+        for (const piece of cn) {
+          const m2 = piece.match(/([^\s:：]{1,12})\s*[:：]\s*([+-]?\d+)/);
+          if (m2) { attrs[m2[1].trim()] = parseInt(m2[2].replace('+', '')); hit = true; }
+        }
+        if (hit) continue;
+      }
+      // 英文「+9 Defense」/「Grants +9 Defense skill」
+      const m = t.match(/([+-]?\d+)\s+(.+?)(?:\s+skill)?$/i);
+      if (m) {
+        const k = String(m[2]).trim().toLowerCase().replace(/\s+/g, '_');
+        attrs[k] = parseInt(m[1].replace('+', ''));
+      } else raw.push(t);
+    }
+    return { attrs, raw };
+  }
+  function parseItemDetails(details) {
+    // data-item-details 形如 "Level Required: 1<br>Grants +9 Defense skill<br>+9 Defense"
+    const txt = String(details || '')
+      .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&').replace(/&quot;/g, '"');
+    const lines = txt.split(/<br\s*\/?>/i).map((x) => x.replace(/<[^>]+>/g, '').trim()).filter(Boolean);
+    return parseAttrList(lines);
+  }
+  function diffGear(prev, snap) {
+    const out = [], pe = (prev && prev.equip) || {}, ne = snap.equip || {};
+    for (const k in ne) {
+      const a = pe[k], b = ne[k];
+      if (!a) { out.push({ at: snap.at, date: snap.date, kind: 'equip', slot: k, to: k, delta: (b.attrs || {}) }); continue; }
+      const da = a.attrs || {}, db = b.attrs || {}, delta = {};
+      for (const p in db) if (db[p] !== da[p]) delta[p] = (db[p] || 0) - (da[p] || 0);
+      if (Object.keys(delta).length) out.push({ at: snap.at, date: snap.date, kind: 'stat', slot: k, delta });
+    }
+    for (const k in pe) if (!ne[k]) out.push({ at: snap.at, date: snap.date, kind: 'unequip', slot: k });
+    return out;
+  }
+  async function collectGear(force) {
+    if (!CFG.gearAuto && !force) return false;
+    if (S.get('gearBusy', 0)) return false;
+    const now = Date.now();
+    if (!force && now - S.get('gearAt', 0) < CFG.gearIntervalMs) return false;
+    S.set({ gearBusy: 1 });
+    try {
+      const ac = (typeof AbortController === 'function') ? new AbortController() : null;
+      const timer = ac ? setTimeout(() => ac.abort(), 45000) : null;   // 防挂起：45s 超时
+      const html = await fetch('/dashboard', { credentials: 'same-origin', signal: ac ? ac.signal : undefined }).then((r) => r.text());
+      if (timer) clearTimeout(timer);
+      // 不用 DOMParser：1 核机器上解析 941KB HTML 要 30s+，正则快一个量级
+      // 结构：<div class="equipped-item-detail"><span class="item-name-level">名</span>
+      //       <div class="item-bonuses-list"><span class="item-bonus">剑: <span class="bonus-value">+56</span></span>...
+      const decodeEnt = (t) => String(t || '').replace(/&#(\d+);/g, (m, d) => String.fromCharCode(+d))
+        .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&').replace(/&quot;/g, '"');
+      const equip = {};
+      let from = 0, autoIdx = 0;
+      for (;;) {
+        const p = html.indexOf('equipped-item-detail"', from);
+        if (p < 0) break;
+        const nx = html.indexOf('equipped-item-detail"', p + 22);      // 边界：下一个槽位
+        const seg = html.slice(p, nx > 0 ? nx : p + 600);
+        const nm = seg.match(/item-name-level[^>]*>([^<]*)</);
+        const bonuses = seg.match(/<span class="item-bonus">[\s\S]*?<\/span>\s*<\/span>/g) || [];
+        const lines = bonuses.map((x) => decodeEnt(x.replace(/<[^>]+>/g, ' ')).replace(/\s+/g, ' ').trim());
+        const name = decodeEnt(nm ? nm[1].trim() : ('slot' + (++autoIdx)));
+        if (!equip[name]) equip[name] = parseAttrList(lines);
+        from = p + 22;
+      }
+      const inv = [], titles = [], details = [];
+      let m;
+      const reT = /data-item-title="([^"]*)"/g;
+      while ((m = reT.exec(html))) titles.push(decodeEnt(m[1]));
+      const reD = /data-item-details="([^"]*)"/g;
+      while ((m = reD.exec(html))) details.push(m[1]);
+      for (let i = 0; i < titles.length; i++) inv.push({ n: titles[i], ...parseItemDetails(details[i] || '') });
+      const pi = html.indexOf('equipment-stats-panel');
+      const setBonus = pi < 0 ? [] : decodeEnt(html.slice(pi, pi + 2500).replace(/<[^>]+>/g, '\n'))
+        .split('\n').map((t) => t.trim()).filter(Boolean).slice(0, 14);
+      const snap = { at: Date.now(), date: new Date().toISOString().slice(0, 10), equip, inv, setBonus };
+      const prev = S.get('gear', null);
+      S.set({ gear: snap, gearAt: Date.now() });
+      if (prev) {
+        const ch = diffGear(prev, snap);
+        if (ch.length) {
+          S.set({ gearLog: (S.get('gearLog', []) || []).concat(ch).slice(-60) });
+          log('装备变更 ' + ch.length + ' 条');
+        }
+      }
+      log('装备采集完成：已装备 ' + Object.keys(equip).length + ' 件 / 背包 ' + inv.length + ' 件');
+      return true;
+    } catch (e) { log('装备采集失败: ' + (e && e.message ? e.message : e)); return false; }
+    finally { S.set({ gearBusy: 0 }); }
+  }
+
+  function ensureDaily() {
+    const d = new Date().toISOString().slice(0, 10);
+    let st = S.get('daily', null);
+    if (!st || st.date !== d) {
+      st = { date: d, chest: [], hunt: { runs: 0, xp: 0, gold: 0 }, sum: { gold: 0, exp: 0, items: 0 } };
+      S.set({ daily: st });
+    }
+    return st;
+  }
+  function parseK(t) {
+    const m = String(t || '').match(/([\d.,]+)\s*([kKmM])?/);
+    if (!m) return 0;
+    let v = parseFloat(m[1].replace(/,/g, ''));
+    if (m[2]) v *= (m[2].toLowerCase() === 'k' ? 1e3 : 1e6);
+    return Math.round(v);
+  }
+  function dailyBox(res) {
+    try {
+      const st = ensureDaily();
+      st.chest.push(new Date().toTimeString().slice(0, 5) + ' ' + res);
+      const num = res.match(/\+([\d,]+)\s*(Gold|金币|EXP|经验)/i);
+      if (num) {
+        const v = parseInt(num[1].replace(/,/g, ''));
+        if (/gold|金币/i.test(num[2])) st.sum.gold += v; else st.sum.exp += v;
+      }
+      const item = res.match(/(?:额外奖励|Extra reward)s?[:：]?\s*(.{0,50}?)(?:\s*(?:继续狩猎|Continue)|$)/i);
+      if (item && item[1].trim()) { st.sum.items++; st.chest.push('　　└ 额外装备: ' + item[1].trim()); }
+      S.set({ daily: st });
+      dbg('收益统计已更新');
+    } catch (e) { dbg('统计失败:' + e.message); }
+  }
+  function dailyHunt() {
+    try {
+      const t = document.body.innerText || '';
+      const xp = t.match(/XP[:\s\n]+([\d.,]+\s*[kKmM]?)/);
+      const gold = t.match(/GOLD[:\s\n]+([\d.,]+\s*[kKmM]?)/i);
+      if (!xp && !gold) return;
+      const st = ensureDaily();
+      st.hunt.runs++;
+      if (xp) st.hunt.xp += parseK(xp[1]);
+      if (gold) st.hunt.gold += parseK(gold[1]);
+      S.set({ daily: st });
+      log('本轮狩猎结算: ' + (xp ? 'XP +' + xp[1] + ' ' : '') + (gold ? 'Gold +' + gold[1] : ''));
+    } catch (e) { dbg('狩猎统计失败:' + e.message); }
+  }
+
   async function maybeGuard() {
     const hp = huntHP();
     if (!hp) return false;
@@ -501,6 +668,7 @@
     if (Date.now() - last < 60000) { dbg('结算冷却中，跳过'); return false; }
     log('血线告警 ' + cur + '/' + max + '，触发止损…');
     S.set({ mode: 'guard', guardAt: Date.now(), maxLife: max });
+    dailyHunt();   // v0.2.15 结算前记录本轮收益
     const stop = first(SEL.stop) || byText(SEL.button, WORD.stop);
     if (stop) { stop.click(); return true; }
     log('找不到结算按钮（可能没在狩猎）');
@@ -676,9 +844,21 @@
       watchdog();
       const pg = page();
       dbg('tick page=' + pg);
+      // 回到已知页面时清掉脱困计时，下次再进未知页/验证页时重新起算
+      if (pg !== 'other' && S.get('otherSince', 0)) S.set({ otherSince: 0 });
+      if (pg !== 'human' && S.get('humanSince', 0)) S.set({ humanSince: 0 });
       if (pg === 'login' || /error=unauthorized|session.*expired/i.test(location.href)) {
         await autoLogin();
       } else if (pg === 'human') {
+        // 人机验证解不开时不能死等（曾因此卡 12 分钟，期间流血致死）：超时撤到 dashboard
+        const hs = S.get('humanSince', 0);
+        if (!hs) { S.set({ humanSince: Date.now() }); }
+        else if (Date.now() - hs > CFG.humanTimeoutMs) {
+          log('人机验证超过 ' + Math.round(CFG.humanTimeoutMs / 60000) + ' 分钟未通过，撤到 dashboard');
+          S.set({ humanSince: 0 });
+          location.href = 'https://www.vanyaonline.com/dashboard';
+          return;
+        }
         await solveHumanCheck();
       } else if (pg === 'hunt') {
         if (S.get('mode') === 'starting') S.set({ mode: 'normal' });
@@ -691,7 +871,7 @@
             await sleep(delay);
             const r = await claimChest();
             log('领取结果: ' + r);
-            if (String(r).indexOf('claimed') === 0) S.set({ claimFail: 0, claimUnlockAt: Date.now() + 1000 });
+            if (String(r).indexOf('claimed') === 0) { S.set({ claimFail: 0, claimUnlockAt: Date.now() + 1000 }); dailyBox(String(r).slice(0, 160)); }
             else {
               const f = S.get('claimFail', 0) + 1;
               S.set({ claimFail: f });
@@ -706,10 +886,35 @@
           const t = first(SEL.chestTimer);
           hud('狩猎中，等宝箱冷却' + (t ? '（' + norm(tx(t)) + '）' : ''));
         }
+      } else if (pg === 'dead') {
+        // 角色阵亡：本次狩猎累积收益清零。点 RETURN TO HOME 回首页，随后去酒馆回血。
+        log('角色阵亡，离开死亡页…');
+        S.set({ mode: 'healing', healSince: Date.now() });
+        const home = Array.from(document.querySelectorAll('a, button, [role=button]'))
+          .find((e) => /return|home|返回|首页/i.test(e.innerText || '') && !/vanya|挂机/i.test(e.innerText || ''));
+        if (home) { home.click(); return; }
+        location.href = 'https://www.vanyaonline.com/pub';
+        return;
       } else if (pg === 'dashboard') {
+        // 防流血致死：站点在重伤时会持续流血，原止损只在 hunt 页生效，
+        // 在 dashboard 待机（尤其人机验证期间）会一路流血到死。
+        const dl = (() => {
+          for (const e of allOf(SEL.maxLife)) {
+            const m = norm(tx(e)).match(/(\d[\d,]*)\s*\/\s*(\d[\d,]*)/);
+            if (m) return [parseInt(m[1].replace(/,/g, '')), parseInt(m[2].replace(/,/g, ''))];
+          }
+          return null;
+        })();
+        if (dl && dl[1] && dl[0] * 100 / dl[1] < Math.max(50, CFG.guardPct + 15)) {
+          log('待机时血量偏低 ' + dl[0] + '/' + dl[1] + '，去酒馆回血（防流血致死）');
+          S.set({ mode: 'healing', healSince: Date.now() });
+          location.href = 'https://www.vanyaonline.com/pub';
+          return;
+        }
         if (S.get('mode') === 'healing') { log('回血中流落 dashboard，回酒馆…'); S.set({ mode: 'healing' }); location.href = 'https://www.vanyaonline.com/pub'; return; }
         await claimDaily();
         await claimDemonPass();
+        await collectGear(false);   // v0.2.18 装备/背包采集（后台取 HTML，不切页签）
         if (CFG.autoStartHunt && S.get('mode', 'normal') === 'normal' && Date.now() - S.get('autoStartAt', 0) > 5 * 60 * 1000) {
           S.set({ mode: 'starting', autoStartAt: Date.now() });
           log('主页待机，自动去开启狩猎…');
@@ -732,6 +937,17 @@
       } else if (pg === 'index') {
         const m = S.get('mode', 'normal');
         if (m === 'normal') location.href = 'https://www.vanyaonline.com/actions/explore';
+      } else if (pg === 'other') {
+        const os2 = S.get('otherSince', 0);
+        if (!os2) { S.set({ otherSince: Date.now() }); log('未知页面 ' + location.pathname + '，观察中…'); return; }
+        if (Date.now() - os2 < CFG.otherTimeoutMs) return;
+        log('未知页面 ' + location.pathname + ' 停留超过 ' + Math.round(CFG.otherTimeoutMs / 1000) + 's，主动脱困');
+        S.set({ otherSince: 0 });
+        const home2 = Array.from(document.querySelectorAll('a, button, [role=button]'))
+          .find((e) => /return|home|返回|首页|dashboard/i.test(e.innerText || '') && !/vanya|挂机/i.test(e.innerText || ''));
+        if (home2) { home2.click(); return; }
+        location.href = 'https://www.vanyaonline.com/dashboard';
+        return;
       }
     } catch (e) { log('异常: ' + (e && e.message ? e.message : e)); }
     finally { busy = false; }
@@ -752,6 +968,10 @@
     reset() { S.clear(); log('状态已清空'); },
     logTail(n = 40) { const b = JSON.parse(localStorage.getItem(LOG_KEY) || '[]'); console.log(b.slice(-n).join('\n')); return b.slice(-n); },
     page, claimChest, startHunt, pubHeal, solveHumanCheck, claimDaily, claimDemonPass,
+    daily: () => S.get('daily', null),
+    gear: () => S.get('gear', null),
+    gearLog: (n = 20) => (S.get('gearLog', []) || []).slice(-n),
+    collectGear: (f) => collectGear(!!f),
     readHP: huntHP, readPubLife: pubLife, readMaxLife: maxLife,
     setState(patch) { S.set(patch || {}); return S.all(); },
   };
@@ -953,5 +1173,17 @@
   tick();
   startTimer();
   startHeartbeat(tick);
-  log('v0.2.13 已启动（' + location.pathname + '）· 右下角 ⚙ 打开控制面板');
+
+  // v0.2.14: 站点界面语言自动切中文（页面无中文特征时点击语言按钮，每文档一次）
+  (async () => {
+    await sleep(2500);
+    try {
+      const txt = (document.body.innerText || '').slice(0, 1200);
+      if (/[\u4e00-\u9fa5]/.test(txt)) return;
+      const btn = byText(['button', 'a', 'li', 'span', 'div'], '中文(简体)|中文（简体）|简体中文');
+      if (btn) { btn.click(); log('检测到非中文界面，已切换为中文'); }
+      else dbg('未找到语言切换按钮');
+    } catch (e) {}
+  })();
+  log('v0.2.18 已启动（' + location.pathname + '）· 右下角 ⚙ 打开控制面板');
 })();

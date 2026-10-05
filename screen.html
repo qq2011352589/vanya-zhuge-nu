@@ -51,6 +51,9 @@
       <button onclick="run('VANYA.state()','out')">状态</button>
       <button onclick="run('JSON.stringify(VANYA.daily(),null,1)','out')">今日收益</button>
       <button onclick="run('VANYA.logTail(20)','out')">日志</button>
+      <button onclick="run('JSON.stringify(VANYA.gear(),null,1)','out')">装备快照</button>
+      <button onclick="run('JSON.stringify(VANYA.gearLog(20),null,1)','out')">装备变更</button>
+      <button onclick="run('VANYA.collectGear(true)','out')">采集装备</button>
     </div>
 
     <div class="sec">
