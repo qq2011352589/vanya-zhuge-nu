@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Vanya 挂机（宝箱 + 血线保护 · 强化版 v0.2 + UI）
 // @namespace    vanya.auto
-// @version      0.2.18
+// @version      0.2.19
 // @description  容错版：多语言文案兼容 + 多套选择器兜底 + 自诊断扫描 + 后台节流对抗 + 交互控制面板。右下角 ⚙ 打开面板。
 // @match        https://www.vanyaonline.com/*
 // @run-at       document-idle
@@ -9,6 +9,9 @@
 // ==/UserScript==
 
 /* ============================================================================
+ * v0.2.19：装备展示人话化——槽位编号("3|Zulu Hat")使换装可看出部位；
+ *           变更记 旧值→新值 而非仅差值；新增背包增减记录；
+ *           VANYA.gearText()/gearLogText() 输出格式化文本（面板默认用它）。
  * v0.2.18：装备/背包属性采集——后台取 dashboard HTML（服务端渲染已含数据），
  *           解析 .equipped-item-detail（身上装备，含名称与属性列表）、
  *           [data-item-title/details]（背包 30 件属性）、套装加成文本；
@@ -528,12 +531,22 @@
         }
         if (hit) continue;
       }
-      // 英文「+9 Defense」/「Grants +9 Defense skill」
-      const m = t.match(/([+-]?\d+)\s+(.+?)(?:\s+skill)?$/i);
-      if (m) {
-        const k = String(m[2]).trim().toLowerCase().replace(/\s+/g, '_');
-        attrs[k] = parseInt(m[1].replace('+', ''));
-      } else raw.push(t);
+      // 英文「+9 Defense」/「Grants +55 magic skill and 40 defense」
+      // → 全局扫「数字+单词」配对，逐个成键（+55 magic、40 defense）
+      let hitEn = false;
+      const pairs = t.match(/([+-]?\d+)\s+([A-Za-z]+)/g);
+      if (pairs) {
+        for (const pr of pairs) {
+          const m2 = pr.match(/([+-]?\d+)\s+([A-Za-z]+)/);
+          if (!m2) continue;
+          let key = String(m2[2]).trim().toLowerCase().replace(/\s+/g, '_');
+          key = key.replace(/_?skill_?/g, '').replace(/^_+|_+$/g, '');
+          if (!key || key === 'and') continue;
+          attrs[key] = parseInt(m2[1].replace('+', ''));
+          hitEn = true;
+        }
+      }
+      if (!hitEn) raw.push(t);
     }
     return { attrs, raw };
   }
@@ -546,15 +559,94 @@
   }
   function diffGear(prev, snap) {
     const out = [], pe = (prev && prev.equip) || {}, ne = snap.equip || {};
-    for (const k in ne) {
-      const a = pe[k], b = ne[k];
-      if (!a) { out.push({ at: snap.at, date: snap.date, kind: 'equip', slot: k, to: k, delta: (b.attrs || {}) }); continue; }
-      const da = a.attrs || {}, db = b.attrs || {}, delta = {};
-      for (const p in db) if (db[p] !== da[p]) delta[p] = (db[p] || 0) - (da[p] || 0);
-      if (Object.keys(delta).length) out.push({ at: snap.at, date: snap.date, kind: 'stat', slot: k, delta });
+    const at = snap.at, date = snap.date;
+    // 身上装备：按槽位名比对（equip 的 key 形如 "3|Zulu Hat"）
+    const slotOf = (k) => String(k).split('|')[0];
+    const nameOf = (k) => String(k).split('|').slice(1).join('|');
+    const bySlotP = {}, bySlotN = {};
+    for (const k in pe) bySlotP[slotOf(k)] = { k, v: pe[k] };
+    for (const k in ne) bySlotN[slotOf(k)] = { k, v: ne[k] };
+    for (const sl in bySlotN) {
+      const a = bySlotP[sl], b = bySlotN[sl];
+      if (!a) { out.push({ at, date, kind: 'equip', slot: sl, to: nameOf(b.k), attrs: b.v.attrs }); continue; }
+      if (nameOf(a.k) !== nameOf(b.k)) {
+        out.push({ at, date, kind: 'swap', slot: sl, from: nameOf(a.k), to: nameOf(b.k), attrs: b.v.attrs });
+        continue;
+      }
+      const da = a.v.attrs || {}, db = b.v.attrs || {}, chg = {};
+      for (const p in db) if (db[p] !== da[p]) chg[p] = { from: da[p] || 0, to: db[p] };
+      for (const p in da) if (!(p in db)) chg[p] = { from: da[p], to: 0 };
+      if (Object.keys(chg).length) out.push({ at, date, kind: 'stat', slot: sl, item: nameOf(b.k), chg });
     }
-    for (const k in pe) if (!ne[k]) out.push({ at: snap.at, date: snap.date, kind: 'unequip', slot: k });
+    for (const sl in bySlotP) if (!bySlotN[sl]) out.push({ at, date, kind: 'unequip', slot: sl, from: nameOf(bySlotP[sl].k) });
+    // 背包增减（按物品名计数）
+    const cnt = (arr) => { const m = {}; for (const it of arr || []) m[it.n] = (m[it.n] || 0) + 1; return m; };
+    const cp = cnt(prev && prev.inv), cn = cnt(snap.inv);
+    for (const k in cn) { const d = (cn[k] || 0) - (cp[k] || 0); if (d > 0) out.push({ at, date, kind: 'inv+', item: k, n: d }); }
+    for (const k in cp) { const d = (cp[k] || 0) - (cn[k] || 0); if (d > 0) out.push({ at, date, kind: 'inv-', item: k, n: d }); }
     return out;
+  }
+  // 人话化：把变更条目转成一行文本
+  function gearLogText(n) {
+    const lg = S.get('gearLog', []) || [];
+    const items = lg.slice(-(n || 20));
+    if (!items.length) return '（暂无装备变更记录）';
+    return items.map(function (e) {
+      const t = new Date(e.at || Date.now()).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+      if (e.kind === 'swap') return t + '  槽位' + e.slot + '：' + e.from + ' → ' + e.to;
+      if (e.kind === 'equip') return t + '  槽位' + e.slot + '：装上 ' + e.to;
+      if (e.kind === 'unequip') return t + '  槽位' + e.slot + '：卸下 ' + e.from;
+      if (e.kind === 'stat') {
+        const parts = [];
+        for (const p in (e.chg || {})) parts.push(p + ' ' + e.chg[p].from + '→' + e.chg[p].to);
+        return t + '  ' + e.item + '：' + parts.join('，');
+      }
+      if (e.kind === 'inv+') return t + '  背包 +' + e.n + ' ' + e.item;
+      if (e.kind === 'inv-') return t + '  背包 -' + e.n + ' ' + e.item;
+      return t + '  ' + JSON.stringify(e);
+    }).join('\n');
+  }
+  // 人话化：当前装备总览
+  function gearText() {
+    const g = S.get('gear', null);
+    if (!g) return '（还没采集过，点「采集装备」）';
+    const lines = [];
+    const ek = Object.keys(g.equip || {});
+    lines.push('== 已装备 ' + ek.length + ' 件 ==  ' + new Date(g.at).toLocaleString('zh-CN'));
+    for (const k of ek) {
+      const it = g.equip[k], slot = String(k).split('|')[0], nm = String(k).split('|').slice(1).join('|');
+      const a = [];
+      for (const p in (it.attrs || {})) if (p !== 'req') a.push(p + '+' + it.attrs[p]);
+      lines.push('  [' + slot + '] ' + nm + (a.length ? '  ' + a.join(' ') : ''));
+    }
+    const inv = (g.inv || []).slice().sort(function (x, y) { return Object.keys(y.attrs || {}).length - Object.keys(x.attrs || {}).length; });
+    lines.push('');
+    lines.push('== 背包 ' + inv.length + ' 件（有属性的优先）==');
+    for (const it of inv.slice(0, 15)) {
+      const a = [];
+      for (const p in (it.attrs || {})) if (p !== 'req') a.push(p + '+' + it.attrs[p]);
+      lines.push('  ' + it.n + (a.length ? '  ' + a.join(' ') : (it.raw && it.raw[0] ? '  ' + String(it.raw[0]).slice(0, 40) : '')));
+    }
+    if (g.setBonus && g.setBonus.length) {
+      // HTML 里键与值在不同 span（"剑:" / "+56"），合并成一行更好读
+      const sb = (g.setBonus || []).filter((x) => !/^(套装加成|展开|Set Bonuses?|Expand)$/i.test(String(x).trim()));
+      const merged = [];
+      for (let i = 0; i < sb.length; i++) {
+        if (/[:：]$/.test(sb[i]) && sb[i + 1] && /^[+-]?\d+$/.test(sb[i + 1])) { merged.push(sb[i] + sb[i + 1]); i++; }
+        else merged.push(sb[i]);
+      }
+      // 物品名与它下面的属性合并到同一行：Serpent 剑 剑:+56
+      const rows = [];
+      let cur = '';
+      for (const x of merged) {
+        if (/[:：]\s*[+-]?\d+$/.test(x)) cur += (cur ? ' ' : '') + x;
+        else { if (cur) rows.push(cur); cur = x; }
+      }
+      if (cur) rows.push(cur);
+      lines.push(''); lines.push('== 套装加成 ==');
+      for (const b of rows.slice(0, 12)) lines.push('  ' + b);
+    }
+    return lines.join('\n');
   }
   async function collectGear(force) {
     if (!CFG.gearAuto && !force) return false;
@@ -582,7 +674,9 @@
         const nm = seg.match(/item-name-level[^>]*>([^<]*)</);
         const bonuses = seg.match(/<span class="item-bonus">[\s\S]*?<\/span>\s*<\/span>/g) || [];
         const lines = bonuses.map((x) => decodeEnt(x.replace(/<[^>]+>/g, ' ')).replace(/\s+/g, ' ').trim());
-        const name = decodeEnt(nm ? nm[1].trim() : ('slot' + (++autoIdx)));
+        // key 形如 "3|Zulu Hat"：槽位序号 + 物品名，换装才能看出是哪个部位
+        const name = (autoIdx + 1) + '|' + decodeEnt(nm ? nm[1].trim() : ('slot' + (autoIdx + 1)));
+        autoIdx++;
         if (!equip[name]) equip[name] = parseAttrList(lines);
         from = p + 22;
       }
@@ -594,7 +688,8 @@
       while ((m = reD.exec(html))) details.push(m[1]);
       for (let i = 0; i < titles.length; i++) inv.push({ n: titles[i], ...parseItemDetails(details[i] || '') });
       const pi = html.indexOf('equipment-stats-panel');
-      const setBonus = pi < 0 ? [] : decodeEnt(html.slice(pi, pi + 2500).replace(/<[^>]+>/g, '\n'))
+      const pg = pi < 0 ? -1 : html.indexOf('>', pi) + 1;   // 跳过标签本身，避免残留 class 名
+      const setBonus = pg < 1 ? [] : decodeEnt(html.slice(pg, pg + 2500).replace(/<[^>]+>/g, '\n'))
         .split('\n').map((t) => t.trim()).filter(Boolean).slice(0, 14);
       const snap = { at: Date.now(), date: new Date().toISOString().slice(0, 10), equip, inv, setBonus };
       const prev = S.get('gear', null);
@@ -971,6 +1066,8 @@
     daily: () => S.get('daily', null),
     gear: () => S.get('gear', null),
     gearLog: (n = 20) => (S.get('gearLog', []) || []).slice(-n),
+    gearText: () => gearText(),
+    gearLogText: (n = 20) => gearLogText(n),
     collectGear: (f) => collectGear(!!f),
     readHP: huntHP, readPubLife: pubLife, readMaxLife: maxLife,
     setState(patch) { S.set(patch || {}); return S.all(); },
@@ -1185,5 +1282,5 @@
       else dbg('未找到语言切换按钮');
     } catch (e) {}
   })();
-  log('v0.2.18 已启动（' + location.pathname + '）· 右下角 ⚙ 打开控制面板');
+  log('v0.2.19 已启动（' + location.pathname + '）· 右下角 ⚙ 打开控制面板');
 })();
