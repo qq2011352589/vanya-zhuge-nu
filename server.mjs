@@ -95,6 +95,7 @@ await ensureThrottle();
 // 3. screencast：按需推流——有人看才抓帧（空闲时 JPEG 编码是 CPU 大头），断流自愈
 let lastFrame = null, frameTs = 0, cdp = null, castOn = false;
 let streamConns = 0, lastShotAt = 0;
+let castTimer = null;   // 主动截图循环的定时器句柄
 let castForced = null;   // null=按观看者自动；true=强制开；false=强制关（省 CPU）
 const IDLE_STOP_MS = 20000;
 
