@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Vanya 挂机（宝箱 + 血线保护 · 强化版 v0.2 + UI）
 // @namespace    vanya.auto
-// @version      0.2.20
+// @version      0.2.21
 // @description  容错版：多语言文案兼容 + 多套选择器兜底 + 自诊断扫描 + 后台节流对抗 + 交互控制面板。右下角 ⚙ 打开面板。
 // @match        https://www.vanyaonline.com/*
 // @run-at       document-idle
@@ -9,6 +9,9 @@
 // ==/UserScript==
 
 /* ============================================================================
+ * v0.2.21：市场评分改按部位匹配（市场商品名英文/身上装备名中文，名称匹配全失败
+ *           导致一周"无可购提升项"；现在用市场标注的部位(Ring/Weapon…)映射到
+ *           身上同部位装备做对比）。
  * v0.2.20：市场扫描（dry-run）——每天自动去 /actions/market 扫品类，
  *           属性库评分（魔法1.0>剑0.8>弓0.65>防御0.5>生命0.2），
  *           gold 计价且可提升的品类按提升量排名；只扫不买，报告在面板。
@@ -729,13 +732,24 @@
     for (const it of (g.inv || [])) if (it.attrs && Object.keys(it.attrs).length) lib[it.n] = it.attrs;
     return lib;
   }
+  // 市场英文部位 → 身上装备的中文部位词（物品名不随界面语言翻译，必须按部位匹配）
+  const SLOT_MAP = { Ring: '戒指', Weapon: '剑', Shield: '书', Boots: '靴子', Gloves: '手套', Armor: '袍', Amulet: '护身符', Hat: '帽', Echo: 'Echo', Pet: '宠物' };
+  function curSlotAttrs(slot, gear) {
+    const zh = SLOT_MAP[slot];
+    if (!zh) return null;
+    for (const k in (gear.equip || {})) {
+      const nm = String(k).split('|').slice(1).join('|');
+      if (nm.indexOf(zh) >= 0 || nm.toLowerCase().indexOf(String(slot).toLowerCase()) >= 0) return (gear.equip[k] || {}).attrs || null;
+    }
+    return null;
+  }
   function decodeEnt2(t) {
     return String(t || '').replace(/&#(\d+);/g, (m, d) => String.fromCharCode(+d));
   }
   // 从市场行文本提取属性（+15 Bow 等）——行内文本流形如 "+15 Bow | +15 Sword | x347"
   function parseRowAttrs(txt) {
     const attrs = {};
-    const parts = String(txt || '').split('|');
+    const parts = String(txt || '').split(/[\n|]/);   // innerText 用 \n 分行（'|' 只是显示格式）
     for (const p of parts) {
       const m = p.trim().match(/^\+?(\d+)\s+([A-Za-z\u4e00-\u9fa5]+)/);
       if (m) attrs[m[2]] = parseInt(m[1]);
@@ -1373,5 +1387,5 @@
       else dbg('未找到语言切换按钮');
     } catch (e) {}
   })();
-  log('v0.2.20 已启动（' + location.pathname + '）· 右下角 ⚙ 打开控制面板');
+  log('v0.2.21 已启动（' + location.pathname + '）· 右下角 ⚙ 打开控制面板');
 })();
